@@ -1,0 +1,39 @@
+name: Build and verify
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install --global pnpm@11.25.0
+      - run: pnpm install --frozen-lockfile && pnpm run build
+        working-directory: web
+      - run: python3 tools/bundle-runtime.py
+      - run: python3 -m pip install -r tests/requirements.txt
+      - run: python3 -m unittest discover -s tests -v
+      - run: |
+          if ! sdkmanager "platforms/android-36" "build-tools/35.0.0"; then
+            sdkmanager "platforms;android-36" "build-tools;35.0.0"
+          fi
+      - run: bash ./gradlew :app:assembleDebug :app:lintDebug --console=plain
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk-and-lint
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/reports/lint-results-debug.html

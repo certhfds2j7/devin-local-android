@@ -1,0 +1,7 @@
+{
+  "filename": "node-v24.22.2-linux-arm64.tar.xz",
+  "sha256": "eb187837a2230d4047161ac0be008584e16b46f726e9c9490ee35dc6b17d9ba8",
+  "source": "https://nodejs.org/dist/latest-v24.x/",
+  "mirror": "https://mirrors.ustc.edu.cn/node/latest-v24.x/",
+  "verifiedOfficial": "https://nodejs.org/download/release/v24.22.2/SHASUMS256.txt"
+}
