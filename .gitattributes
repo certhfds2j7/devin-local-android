@@ -1,3 +1,5 @@
 * text=auto eol=lf
 *.bat text eol=crlf
 *.jar binary
+app/src/main/assets/web/*.js -whitespace
+app/src/main/assets/THIRD_PARTY_LICENSES.txt -whitespace
