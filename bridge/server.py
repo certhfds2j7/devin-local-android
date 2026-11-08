@@ -31,7 +31,7 @@ if os.name == "posix":
     import fcntl
 from aiohttp import web
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_ATTACHMENT = 20 * 1024 * 1024
 MAX_DOWNLOAD = 50 * 1024 * 1024
 BRIDGE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -41,6 +41,8 @@ PROJECTS = ROOT / "workspaces"
 SESSIONS = ROOT / "sessions"
 AGENTS: dict[str, "Agent"] = {}
 TERMINALS: dict[str, "Terminal"] = {}
+PROJECT_LOCKS = {}
+PROJECT_DELETING = set()
 EVENTS: set[web.WebSocketResponse] = set()
 UPDATE = {"state": "idle"}
 UPDATE_TASK = None
@@ -52,6 +54,8 @@ os.environ["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + os.environ.g
 
 def initialize():
     global TOKEN, UPDATE
+    PROJECT_LOCKS.clear()
+    PROJECT_DELETING.clear()
     os.umask(0o077)
     for folder in (ROOT, PROJECTS, SESSIONS):
         folder.mkdir(parents=True, exist_ok=True)
@@ -132,9 +136,36 @@ def project(pid):
     if str(uuid.UUID(pid)) != pid:
         error("项目编号不正确")
     folder = PROJECTS / pid
+    if pid in PROJECT_DELETING:
+        error("项目正在删除，请稍后操作", 409)
+    if folder.is_symlink() or getattr(folder, "is_junction", lambda: False)() or folder.resolve().parent != PROJECTS.resolve():
+        error("项目目录不在本地工作区内", 403)
     if not (folder / "project.json").exists():
         error("项目不存在", 404)
     return folder / "files"
+
+
+def project_lock(pid):
+    return PROJECT_LOCKS.setdefault(pid, asyncio.Lock())
+
+
+def display_name(value, label):
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 100 or any(ord(c) < 32 for c in value):
+        error(label + "须为 1 至 100 个字符，且不能包含换行或控制字符")
+    return value.strip()
+
+
+@web.middleware
+async def serialize_project_requests(request, handler):
+    pid = request.match_info.get("pid")
+    if not pid and request.match_info.get("sid") and request.method in ("PATCH", "DELETE"):
+        pid = session_meta(request.match_info["sid"])["projectId"]
+    if pid:
+        project(pid)
+        async with project_lock(pid):
+            project(pid)
+            return await handler(request)
+    return await handler(request)
 
 
 def safe_path(root, relative, must_exist=False):
@@ -186,9 +217,7 @@ async def projects(request):
         values = [json.loads(x.read_text(encoding="utf-8")) for x in PROJECTS.glob("*/project.json")]
         return web.json_response(sorted(values, key=lambda x: x["created"], reverse=True))
     data = await request.json()
-    name = str(data.get("name", "")).strip()[:100]
-    if not name or any(ord(c) < 32 for c in name):
-        error("请输入项目名称")
+    name = display_name(data.get("name", ""), "项目名称")
     pid = str(uuid.uuid4())
     folder = PROJECTS / pid
     files = folder / "files"
@@ -204,6 +233,53 @@ async def projects(request):
     atomic_json(folder / "project.json", meta)
     await command(["git", "init", "-q"], files)
     return web.json_response(meta, status=201)
+
+
+async def project_action(request):
+    pid = request.match_info["pid"]
+    folder = project(pid).parent
+    meta = json.loads((folder / "project.json").read_text(encoding="utf-8"))
+    data = await request.json()
+    if request.method == "PATCH":
+        meta["name"] = display_name(data.get("name"), "项目名称")
+        atomic_json(folder / "project.json", meta)
+        return web.json_response(meta)
+    if data.get("confirmName") != meta["name"]:
+        error("项目名称确认不一致，请重新核对后再删除", 409)
+    if UPDATE["state"] == "running":
+        error("核心正在更新，请完成后再删除项目", 409)
+    related = [x for x in AGENTS.values() if x.meta["projectId"] == pid]
+    if any(x.busy for x in related):
+        error("项目中有运行中或等待授权的任务，请先结束或取消任务", 409)
+    if any(x.project_id == pid for x in TERMINALS.values()):
+        error("项目中有打开的终端，请先关闭终端再删除", 409)
+    # Validate all recursive deletion roots before deleting anything. Display names never form paths.
+    folder = folder.resolve()
+    if folder.parent != PROJECTS.resolve() or folder.parent != ROOT.resolve() / "workspaces" or folder.name != pid:
+        error("项目删除路径不正确", 403)
+    attachments = ROOT / "attachments" / pid
+    if attachments.is_symlink() or getattr(attachments, "is_junction", lambda: False)() or attachments.resolve().parent != ROOT.resolve() / "attachments":
+        error("附件删除路径不正确", 403)
+    sessions = []
+    for path in SESSIONS.glob("*.json"):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if value.get("projectId") == pid:
+            if str(uuid.UUID(path.stem)) != path.stem: error("对话记录编号不正确")
+            sessions.append(path.stem)
+    PROJECT_DELETING.add(pid)
+    try:
+        for agent in related:
+            await agent.close()
+            for socket in list(agent.sockets): await socket.close()
+            AGENTS.pop(agent.id, None)
+        shutil.rmtree(folder)
+        if attachments.exists(): shutil.rmtree(attachments.resolve())
+        for sid in sessions:
+            for suffix in (".json", ".jsonl"):
+                (SESSIONS / (sid + suffix)).unlink(missing_ok=True)
+    finally:
+        PROJECT_DELETING.discard(pid)
+    return web.json_response({"ok": True, "deletedProjectId": pid, "scope": "local-project-and-client-history"})
 
 
 async def command(arguments, cwd, timeout=60, input_data=None):
@@ -726,13 +802,35 @@ async def agent_delete(request):
     return web.json_response({"ok": True, "scope": "client-local-history"})
 
 
+async def agent_rename(request):
+    sid = request.match_info["sid"]
+    meta = session_meta(sid)
+    data = await request.json()
+    title = display_name(data.get("title"), "对话名称")
+    agent = AGENTS.get(sid)
+    if agent:
+        agent.meta["title"] = title
+        agent.save()
+        meta = agent.meta
+    else:
+        meta["title"] = title
+        atomic_json(SESSIONS / (sid + ".json"), meta)
+    return web.json_response(meta)
+
+
 async def agents(request):
     if request.method == "GET":
         rows = [json.loads(x.read_text(encoding="utf-8")) for x in SESSIONS.glob("*.json")]
         return web.json_response(sorted(rows, key=lambda x: x.get("updated", 0), reverse=True))
+    data = await request.json()
+    project(data["projectId"])
+    async with project_lock(data["projectId"]):
+        return await create_agent(data)
+
+
+async def create_agent(data):
     if UPDATE["state"] == "running":
         error("核心正在更新，请稍后开始任务", 409)
-    data = await request.json()
     project(data["projectId"])
     if data.get("resumeId"):
         meta = session_meta(data["resumeId"])
@@ -743,7 +841,7 @@ async def agents(request):
             return web.json_response(existing.meta)
     else:
         meta = {"id": str(uuid.uuid4()), "projectId": data["projectId"],
-                "title": data.get("title", "新对话")[:100], "state": "connecting"}
+                "title": display_name(data.get("title", "新对话"), "对话名称"), "state": "connecting"}
     agent = Agent(meta)
     try:
         await agent.start()
@@ -916,6 +1014,12 @@ async def terminal_create(request):
     if UPDATE["state"] == "running":
         error("核心更新期间暂不启动终端", 409)
     data = await request.json()
+    project(data["projectId"])
+    async with project_lock(data["projectId"]):
+        return await create_terminal(data)
+
+
+async def create_terminal(data):
     terminal = Terminal(data["projectId"])
     TERMINALS[terminal.id] = terminal
     try:
@@ -1117,10 +1221,12 @@ async def shutdown(request):
 
 
 def application():
-    app = web.Application(middlewares=[guard], client_max_size=100 * 1024 * 1024)
+    app = web.Application(middlewares=[guard, serialize_project_requests], client_max_size=100 * 1024 * 1024)
     app.add_routes([
         web.get("/v1/health", health), web.get("/v1/events", events),
         web.route("*", "/v1/projects", projects),
+        web.patch("/v1/projects/{pid}", project_action),
+        web.delete("/v1/projects/{pid}", project_action),
         web.get("/v1/projects/{pid}/files", file_list),
         web.get("/v1/projects/{pid}/download", file_download),
         web.post("/v1/projects/{pid}/attachments", attachment_upload),
@@ -1130,6 +1236,7 @@ def application():
         web.route("*", "/v1/projects/{pid}/archive", archive),
         web.route("*", "/v1/agents", agents),
         web.delete("/v1/agents/{sid}", agent_delete),
+        web.patch("/v1/agents/{sid}", agent_rename),
         web.get("/v1/agents/{sid}/stream", agent_stream),
         web.route("*", "/v1/agents/{sid}/{action}", agent_action),
         web.post("/v1/terminals", terminal_create),

@@ -11,6 +11,7 @@ import zipfile
 import hashlib
 import tarfile
 from unittest.mock import patch, AsyncMock
+from types import SimpleNamespace
 from aiohttp.test_utils import TestClient, TestServer
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -69,6 +70,151 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                                          json={"revision": original, "content": "stale editor"})
         self.assertEqual(response.status, 409)
         self.assertEqual(target.read_text(), "agent changed this")
+
+    async def test_project_rename_preserves_id_files_git_and_session(self):
+        root = bridge.project(self.project["id"])
+        (root / "keep.txt").write_text("keep")
+        agent = await self.make_agent()
+        response = await self.client.patch(self.path, headers=self.auth, json={"name": "  中文项目 / ../ 😀  "})
+        self.assertEqual(response.status, 200)
+        renamed = await response.json()
+        self.assertEqual(renamed["name"], "中文项目 / ../ 😀")
+        self.assertEqual(renamed["id"], self.project["id"])
+        self.assertEqual(root, bridge.project(self.project["id"]))
+        self.assertEqual((root / "keep.txt").read_text(), "keep")
+        self.assertTrue((root / ".git").is_dir())
+        self.assertEqual(bridge.session_meta(agent["id"])["projectId"], self.project["id"])
+
+    async def test_rename_validation_does_not_change_existing_metadata(self):
+        agent = await self.make_agent()
+        for invalid in ("", "   ", "换\n行", "a" * 101, None, 1):
+            response = await self.client.patch(self.path, headers=self.auth, json={"name": invalid})
+            self.assertEqual(response.status, 400)
+            response = await self.client.patch("/v1/agents/" + agent["id"], headers=self.auth, json={"title": invalid})
+            self.assertEqual(response.status, 400)
+        self.assertEqual(json.loads((bridge.PROJECTS / self.project["id"] / "project.json").read_text(encoding="utf-8"))["name"], "测试项目")
+        self.assertEqual(bridge.session_meta(agent["id"])["title"], "新对话")
+
+    async def test_conversation_rename_persists_for_live_and_closed_agents(self):
+        agent = await self.make_agent()
+        instance = bridge.AGENTS[agent["id"]]
+        await instance.broadcast({"type": "user", "text": "retained"})
+        response = await self.client.patch("/v1/agents/" + agent["id"], headers=self.auth, json={"title": "活跃会话新名称"})
+        self.assertEqual(response.status, 200)
+        instance.save()
+        self.assertEqual(bridge.session_meta(agent["id"])["title"], "活跃会话新名称")
+        await instance.close()
+        bridge.AGENTS.pop(agent["id"])
+        response = await self.client.patch("/v1/agents/" + agent["id"], headers=self.auth, json={"title": "旧会话新名称"})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(bridge.session_meta(agent["id"])["title"], "旧会话新名称")
+        history = (bridge.SESSIONS / (agent["id"] + ".jsonl")).read_text()
+        self.assertIn("retained", history)
+
+    async def test_project_delete_requires_current_exact_name(self):
+        for body in ({}, {"confirmName": "错误项目"}):
+            response = await self.client.delete(self.path, headers=self.auth, json=body)
+            self.assertEqual(response.status, 409)
+        await self.client.patch(self.path, headers=self.auth, json={"name": "新项目名称"})
+        response = await self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"})
+        self.assertEqual(response.status, 409)
+        self.assertTrue(bridge.project(self.project["id"]).exists())
+
+    async def test_project_delete_removes_only_its_files_attachments_and_histories(self):
+        root = bridge.project(self.project["id"])
+        (root / "result.bin").write_bytes(b"result")
+        upload = await (await self.client.post(self.path + "/attachments", params={"name": "input.bin"}, headers=self.auth, data=b"input")).json()
+        agent = await self.make_agent()
+        await bridge.AGENTS[agent["id"]].broadcast({"type": "user", "text": "delete test"})
+        other = await (await self.client.post("/v1/projects", headers=self.auth, json={"name": "保留项目", "kind": "empty"})).json()
+        other_root = bridge.project(other["id"])
+        (other_root / "keep.txt").write_text("retained")
+        other_agent = await (await self.client.post("/v1/agents", headers=self.auth, json={"projectId": other["id"]})).json()
+        await bridge.AGENTS[other_agent["id"]].broadcast({"type": "user", "text": "keep history"})
+        response = await self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"})
+        self.assertEqual(response.status, 200)
+        self.assertFalse((bridge.PROJECTS / self.project["id"]).exists())
+        self.assertFalse((bridge.ROOT / "attachments" / self.project["id"]).exists())
+        self.assertFalse((bridge.SESSIONS / (agent["id"] + ".json")).exists())
+        self.assertFalse((bridge.SESSIONS / (agent["id"] + ".jsonl")).exists())
+        self.assertNotIn(agent["id"], bridge.AGENTS)
+        self.assertEqual((other_root / "keep.txt").read_text(), "retained")
+        self.assertIn(other_agent["id"], bridge.AGENTS)
+        self.assertIn("keep history", (bridge.SESSIONS / (other_agent["id"] + ".jsonl")).read_text())
+
+    async def test_project_delete_rejects_running_tasks_terminals_and_core_upgrade(self):
+        agent = await self.make_agent()
+        instance = bridge.AGENTS[agent["id"]]
+        instance.busy = True
+        response = await self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"})
+        self.assertEqual(response.status, 409)
+        instance.busy = False
+        bridge.TERMINALS["fixture"] = SimpleNamespace(project_id=self.project["id"], close=AsyncMock())
+        response = await self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"})
+        self.assertEqual(response.status, 409)
+        bridge.TERMINALS.clear()
+        bridge.UPDATE = {"state": "running"}
+        response = await self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"})
+        self.assertEqual(response.status, 409)
+        bridge.UPDATE = {"state": "idle"}
+        self.assertTrue(bridge.project(self.project["id"]).exists())
+
+    async def test_project_delete_rejects_symlink_root_before_removing_any_data(self):
+        folder = bridge.PROJECTS / self.project["id"]
+        original = Path.is_symlink
+        with patch.object(Path, "is_symlink", lambda path: path == folder or original(path)):
+            response = await self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"})
+        self.assertEqual(response.status, 403)
+        self.assertTrue((folder / "project.json").exists())
+
+    async def test_project_deletion_waits_for_inflight_project_operation(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def slow_command(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return 0, b"", b""
+        with patch.object(bridge, "command", side_effect=slow_command):
+            git = asyncio.create_task(self.client.post(self.path + "/git", headers=self.auth, json={"action": "stage"}))
+            await asyncio.wait_for(started.wait(), 3)
+            deletion = asyncio.create_task(self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"}))
+            await asyncio.sleep(0.05)
+            self.assertFalse(deletion.done())
+            self.assertTrue(bridge.project(self.project["id"]).exists())
+            release.set()
+            self.assertEqual((await git).status, 200)
+            self.assertEqual((await deletion).status, 200)
+
+    async def test_project_delete_rejects_redirected_attachment_root(self):
+        base = bridge.ROOT / "attachments"
+        target = base / self.project["id"]
+        actual = Path.resolve
+        def redirected(path, *args, **kwargs):
+            if path == base: return bridge.ROOT / "private-copy"
+            if path == target: return bridge.ROOT / "private-copy" / self.project["id"]
+            return actual(path, *args, **kwargs)
+        with patch.object(Path, "resolve", redirected):
+            response = await self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"})
+        self.assertEqual(response.status, 403)
+        self.assertTrue((bridge.PROJECTS / self.project["id"] / "project.json").exists())
+
+    async def test_project_deletion_waits_for_connecting_agent_without_orphan_history(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def delayed_start(instance):
+            started.set()
+            await release.wait()
+            instance.process = SimpleNamespace(returncode=0)
+            instance.meta["state"] = "ready"
+            instance.save()
+        with patch.object(bridge.Agent, "start", delayed_start):
+            creation = asyncio.create_task(self.client.post("/v1/agents", headers=self.auth, json={"projectId": self.project["id"]}))
+            await asyncio.wait_for(started.wait(), 3)
+            deletion = asyncio.create_task(self.client.delete(self.path, headers=self.auth, json={"confirmName": "测试项目"}))
+            await asyncio.sleep(0.05)
+            self.assertFalse(deletion.done())
+            release.set()
+            self.assertEqual((await creation).status, 200)
+            self.assertEqual((await deletion).status, 200)
+        self.assertEqual(list(bridge.SESSIONS.glob("*.json")), [])
 
     async def test_binary_attachment_and_download_preserve_bytes_and_unicode_filename(self):
         data = bytes(range(256)) * 4

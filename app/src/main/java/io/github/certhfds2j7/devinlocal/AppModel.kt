@@ -20,6 +20,7 @@ import java.security.MessageDigest
 fun JSONArray.objects(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
 fun encoded(value: String): String = URLEncoder.encode(value, "UTF-8")
 data class ChatLine(val role: String, val text: String, val toolId: String? = null, val files: List<JSONObject> = emptyList())
+data class RenameItem(val kind: String, val id: String, val name: String)
 
 class AppModel(app: Application): AndroidViewModel(app) {
     val api = BridgeClient(app)
@@ -63,6 +64,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
     private var chatGeneration = 0L
     private var reconnectAttempt = 0
     private val draftJobs = mutableMapOf<String, Job>()
+    private val draftProjects = mutableMapOf<String, String>()
     private val draftMutex = Mutex()
     val projectId get() = selected?.optString("id").orEmpty()
     val dirty get() = filePath.isNotEmpty() && editorText != originalText
@@ -130,6 +132,48 @@ class AppModel(app: Application): AndroidViewModel(app) {
         chooseProject(created)
         note = "项目已创建在手机本地"
     }
+    fun renameItem(item: RenameItem, name: String) = act {
+        if (item.kind == "project") {
+            val updated = api.obj("/v1/projects/${item.id}", "PATCH", JSONObject().put("name", name))
+            projects = projects.map { if (it.optString("id") == item.id) updated else it }
+            if (projectId == item.id) selected = updated
+            note = "项目名称已更新"
+        } else {
+            val updated = api.obj("/v1/agents/${item.id}", "PATCH", JSONObject().put("title", name))
+            if (agent?.optString("id") == item.id) agent = updated
+            refreshSessions()
+            note = "对话名称已更新"
+        }
+    }
+    fun deleteProject(item: JSONObject, confirmation: String) = act {
+        val id = item.getString("id")
+        api.obj("/v1/projects/$id", "DELETE", JSONObject().put("confirmName", confirmation))
+        val ownedDrafts = draftProjects.filterValues { it == id }.keys.toList()
+        ownedDrafts.forEach { path -> draftJobs.remove(path)?.cancel(); draftProjects.remove(path) }
+        if (projectId == id && filePath.isNotEmpty()) {
+            val currentDraft = draftFile()
+            draftJobs.remove(currentDraft.path)?.cancel()
+            withContext(Dispatchers.IO) { currentDraft.delete() }
+        }
+        draftMutex.withLock {
+            withContext(Dispatchers.IO) {
+                File(getApplication<Application>().filesDir, "drafts").listFiles()?.filter { it.isFile }?.forEach { file ->
+                    val owner = try { JSONObject(file.readText()).optString("projectId") } catch (_: Exception) { "" }
+                    if (owner == id || file.path in ownedDrafts) file.delete()
+                }
+            }
+        }
+        projects = projects.filterNot { it.optString("id") == id }
+        if (projectId == id) {
+            detachChat(); terminalSocket?.close(1000, "project deleted"); terminalSocket = null; terminalId = null
+            selected = null; preferences.edit().remove("project").apply()
+            agent = null; messages.clear(); permission = null; agentBusy = false; chatInput = ""; conversations = emptyList()
+            pendingAttachments.clear(); files = emptyList(); folder = ""; filePath = ""; editorText = ""; originalText = ""
+            fileRevision = "missing"; conflict = false; searchResults = emptyList(); gitStatus = ""; gitDiff = ""
+            downloadFiles = emptyList(); downloadFolder = ""; tab = 0
+        }
+        note = "项目及其本机文件和对话已删除"
+    }
     suspend fun refreshFiles(path: String = folder) {
         if (projectId.isEmpty()) return
         folder = path
@@ -162,7 +206,8 @@ class AppModel(app: Application): AndroidViewModel(app) {
         if (filePath.isEmpty()) return
         val file = draftFile()
         file.parentFile?.mkdirs()
-        val data = JSONObject().put("text", text).put("revision", fileRevision).toString()
+        draftProjects[file.path] = projectId
+        val data = JSONObject().put("text", text).put("revision", fileRevision).put("projectId", projectId).toString()
         draftJobs[file.path]?.cancel()
         draftJobs[file.path] = viewModelScope.launch {
             delay(150)

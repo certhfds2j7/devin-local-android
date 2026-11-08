@@ -99,6 +99,8 @@ class MainActivity: ComponentActivity() {
         var closeTerminalDialog by remember { mutableStateOf(false) }
         var downloadDialog by remember { mutableStateOf(false) }
         var deleteDialog by remember { mutableStateOf<JSONObject?>(null) }
+        var renameTarget by remember { mutableStateOf<RenameItem?>(null) }
+        var deleteProjectTarget by remember { mutableStateOf<JSONObject?>(null) }
         var cachedDownload by rememberSaveable { mutableStateOf("") }
         val saveDownload = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
             val cached = cachedDownload; cachedDownload = ""
@@ -214,6 +216,11 @@ class MainActivity: ComponentActivity() {
                                     Text(when (item.optString("kind")) { "python" -> "Python 项目"; "web" -> "网站项目"; else -> "通用项目" },
                                         style = MaterialTheme.typography.bodySmall)
                                     if (current) Text("当前工作项目", color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
+                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                        TextButton(onClick = { renameTarget = RenameItem("project", item.getString("id"), item.getString("name")) }, enabled = vm.operations == 0) { Text("重命名") }
+                                        TextButton(onClick = { deleteProjectTarget = item }, enabled = vm.operations == 0,
+                                            colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除项目") }
+                                    }
                                 }
                             }
                         }
@@ -233,6 +240,12 @@ class MainActivity: ComponentActivity() {
                     }
                     1 -> {
                         ProjectHeading(vm)
+                        vm.agent?.let { current ->
+                            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text(current.optString("title", "新对话"), Modifier.weight(1f), fontWeight = FontWeight.SemiBold, maxLines = 2)
+                                TextButton(onClick = { renameTarget = RenameItem("session", current.getString("id"), current.optString("title", "新对话")) }, enabled = vm.operations == 0) { Text("重命名") }
+                            }
+                        }
                         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             TextButton(onClick = { vm.startChat() }, enabled = vm.connected && vm.projectId.isNotEmpty()) { Text("新对话") }
@@ -363,14 +376,40 @@ class MainActivity: ComponentActivity() {
             text = { Column(Modifier.verticalScroll(rememberScrollState())) {
                 if (vm.conversations.isEmpty()) Text("当前项目还没有历史会话")
                 vm.conversations.forEach { item ->
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(modifier = Modifier.weight(1f), onClick = { historyDialog = false; vm.startChat(item) }) {
+                    Column(Modifier.fillMaxWidth()) {
+                    TextButton(onClick = { historyDialog = false; vm.startChat(item) }) {
                         Text(item.optString("title", "对话") + " · " + stateName(item.optString("state")))
                     }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = { renameTarget = RenameItem("session", item.getString("id"), item.optString("title", "新对话")) }, enabled = vm.operations == 0) { Text("重命名") }
                     TextButton(onClick = { deleteDialog = item }, enabled = item.optString("state") !in listOf("running", "waiting")) { Text("删除") }
+                    }
+                    HorizontalDivider()
                     }
                 }
             } }, confirmButton = { TextButton(onClick = { historyDialog = false }) { Text("关闭") } })
+        renameTarget?.let { target -> key(target.kind, target.id) {
+            var name by rememberSaveable { mutableStateOf(target.name) }
+            AlertDialog(onDismissRequest = { renameTarget = null }, title = { Text(if (target.kind == "project") "重命名项目" else "重命名对话") },
+                text = { OutlinedTextField(name, { name = it }, label = { Text("新名称") }, singleLine = true,
+                    supportingText = { Text("${name.trim().length}/100") }) },
+                confirmButton = { TextButton(onClick = { vm.renameItem(target, name.trim()); renameTarget = null },
+                    enabled = name.trim().length in 1..100 && vm.operations == 0) { Text("保存名称") } },
+                dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("取消") } })
+        } }
+        deleteProjectTarget?.let { target -> key(target.getString("id")) {
+            var confirmation by rememberSaveable { mutableStateOf("") }
+            AlertDialog(onDismissRequest = { deleteProjectTarget = null }, title = { Text("删除项目？") }, text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("将永久删除“${target.getString("name") }”的本机文件、Git 记录、附件及本客户端对话。请先导出需要保留的文件。")
+                    if (vm.projectId == target.getString("id") && vm.dirty) Text("当前项目有未保存的编辑，删除后无法恢复。", color = MaterialTheme.colorScheme.error)
+                    OutlinedTextField(confirmation, { confirmation = it }, label = { Text("输入项目名称确认") }, singleLine = true)
+                }
+            }, confirmButton = { TextButton(onClick = { vm.deleteProject(target, confirmation); deleteProjectTarget = null },
+                enabled = confirmation == target.getString("name") && vm.operations == 0,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("永久删除") } },
+                dismissButton = { TextButton(onClick = { deleteProjectTarget = null }) { Text("取消") } })
+        } }
         deleteDialog?.let { item -> AlertDialog(onDismissRequest = { deleteDialog = null }, title = { Text("删除这条对话？") },
             text = { Text("将删除本客户端保存的“${item.optString("title", "对话") }”记录，无法在本客户端撤销。项目文件会保留。") },
             confirmButton = { TextButton(onClick = { vm.deleteConversation(item); deleteDialog = null }) { Text("删除记录") } },
