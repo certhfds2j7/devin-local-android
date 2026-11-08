@@ -7,6 +7,7 @@ import android.webkit.*
 import androidx.compose.runtime.*
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.webkit.WebViewAssetLoader
 import okhttp3.Response
@@ -23,7 +24,30 @@ private fun offlineWebView(view: WebView, ready: () -> Unit) {
     view.settings.allowContentAccess = false
     view.settings.domStorageEnabled = false
     view.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+    view.layoutParams = android.view.ViewGroup.LayoutParams(
+        android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
+    view.webChromeClient = object: WebChromeClient() {
+        override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+            if (message.messageLevel() == ConsoleMessage.MessageLevel.ERROR &&
+                message.sourceId().startsWith("https://appassets.androidplatform.net/assets/web/")) {
+                val text = message.message().take(220)
+                val safe = if (Regex("token|password|secret|credential|Bearer|PAIRING", RegexOption.IGNORE_CASE).containsMatchIn(text))
+                    "Bundled view failed" else text
+                android.util.Log.e("DevinBundledView", message.sourceId().substringAfterLast("/") + ":" + message.lineNumber() + " " + safe)
+            }
+            return true
+        }
+    }
     view.webViewClient = object: WebViewClient() {
+        override fun onPageFinished(v: WebView, url: String) {
+            v.evaluateJavascript("JSON.stringify({path:location.pathname,state:document.readyState,terminal:typeof window.writeTerminal,editor:typeof window.loadFile,native:typeof window.Native,width:innerWidth,height:innerHeight})") {
+                android.util.Log.i("DevinPanelLoad", it ?: "empty")
+            }
+            ready()
+        }
+        override fun onReceivedError(v: WebView, request: WebResourceRequest, failure: WebResourceError) {
+            android.util.Log.e("DevinPanelLoad", "resource=" + request.url.lastPathSegment + " code=" + failure.errorCode)
+        }
         override fun shouldInterceptRequest(v: WebView?, request: WebResourceRequest): WebResourceResponse? {
             if (request.url.host != "appassets.androidplatform.net")
                 return WebResourceResponse("text/plain", "utf-8", 403, "Blocked", emptyMap(), "".byteInputStream())
@@ -47,7 +71,7 @@ fun CodeEditor(model: AppModel, modifier: Modifier = Modifier) {
             JSONObject.quote(model.filePath) + "," + dark + ");", null)
         rendered = model.editorLoadId
     }
-    AndroidView(modifier = modifier, factory = { context ->
+    AndroidView(modifier = modifier.clipToBounds(), factory = { context ->
         WebView(context).also { view ->
             web = view
             offlineWebView(view) { }
@@ -57,10 +81,9 @@ fun CodeEditor(model: AppModel, modifier: Modifier = Modifier) {
             }, "Native")
             view.loadUrl("https://appassets.androidplatform.net/assets/web/editor.html")
         }
-    }, update = { render() })
-    DisposableEffect(Unit) {
-        onDispose { web?.removeJavascriptInterface("Native"); web?.destroy() }
-    }
+    }, update = { render() }, onRelease = { view ->
+        view.removeJavascriptInterface("Native"); view.destroy()
+    })
 }
 
 @Composable
@@ -68,7 +91,7 @@ fun TerminalPanel(model: AppModel, modifier: Modifier = Modifier) {
     var web by remember { mutableStateOf<WebView?>(null) }
     val main = remember { Handler(Looper.getMainLooper()) }
     val id = model.terminalId
-    AndroidView(modifier = modifier, factory = { context ->
+    AndroidView(modifier = modifier.clipToBounds(), factory = { context ->
         WebView(context).also { view ->
             web = view
             offlineWebView(view) { }
@@ -114,12 +137,13 @@ fun TerminalPanel(model: AppModel, modifier: Modifier = Modifier) {
             }, "Native")
             view.loadUrl("https://appassets.androidplatform.net/assets/web/terminal.html")
         }
+    }, onRelease = { view ->
+        view.removeJavascriptInterface("Native"); view.destroy()
     })
     DisposableEffect(id) {
         onDispose {
             model.terminalSocket?.close(1000, "ui detached")
             model.terminalSocket = null
-            web?.removeJavascriptInterface("Native"); web?.destroy()
         }
     }
 }
