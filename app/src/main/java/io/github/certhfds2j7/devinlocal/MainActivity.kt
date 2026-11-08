@@ -58,6 +58,7 @@ class MainActivity: ComponentActivity() {
     }
     override fun onPostResume() {
         super.onPostResume()
+        model.resumeConnections()
         if (recoverPairing && LinkState.token(this) == null &&
             ContextCompat.checkSelfPermission(this, TermuxLauncher.PERMISSION) == PackageManager.PERMISSION_GRANTED) {
             recoverPairing = false
@@ -211,10 +212,11 @@ class MainActivity: ComponentActivity() {
                                 else Card(colors = CardDefaults.cardColors(containerColor =
                                     if (line.role == "user") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer)) {
                                     Column(Modifier.fillMaxWidth().padding(14.dp)) {
-                                        Text(if (line.role == "user") "你" else "Devin", fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                                        Text(when (line.role) { "user" -> "你"; "tool" -> "本地工具输出"; else -> "Devin" }, fontSize = 11.sp, fontWeight = FontWeight.Bold,
                                             color = MaterialTheme.colorScheme.primary)
                                         Spacer(Modifier.height(6.dp))
-                                        SelectionContainer { Text(line.text, fontSize = 14.sp) }
+                                        SelectionContainer { Text(line.text, fontSize = 14.sp,
+                                            fontFamily = if (line.role == "tool") FontFamily.Monospace else FontFamily.Default) }
                                     }
                                 }
                             }

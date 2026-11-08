@@ -67,6 +67,8 @@ class BridgeClient(private val context: Context) {
         const val BASE = "http://127.0.0.1:8765"
         val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS).build()
+        private val streams = http.newBuilder().readTimeout(0, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS).build()
     }
     suspend fun bytes(path: String, method: String = "GET", body: ByteArray? = null, type: String = "application/json"): ByteArray =
         withContext(Dispatchers.IO) {
@@ -88,7 +90,7 @@ class BridgeClient(private val context: Context) {
     suspend fun array(path: String) = JSONArray(String(bytes(path)))
     fun socket(path: String, listener: WebSocketListener): WebSocket {
         val token = LinkState.token(context) ?: throw ApiException(401, "请先连接本地环境")
-        return http.newWebSocket(Request.Builder().url(BASE.replace("http:", "ws:") + path)
+        return streams.newWebSocket(Request.Builder().url(BASE.replace("http:", "ws:") + path)
             .header("Authorization", "Bearer $token").build(), listener)
     }
 }

@@ -19,7 +19,7 @@ import java.security.MessageDigest
 
 fun JSONArray.objects(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
 fun encoded(value: String): String = URLEncoder.encode(value, "UTF-8")
-data class ChatLine(val role: String, val text: String)
+data class ChatLine(val role: String, val text: String, val toolId: String? = null)
 
 class AppModel(app: Application): AndroidViewModel(app) {
     val api = BridgeClient(app)
@@ -57,6 +57,8 @@ class AppModel(app: Application): AndroidViewModel(app) {
     var appUpdate by mutableStateOf<JSONObject?>(null)
     private var lastSequence = 0L
     private var reconnectJob: Job? = null
+    private var chatGeneration = 0L
+    private var reconnectAttempt = 0
     private val draftJobs = mutableMapOf<String, Job>()
     private val draftMutex = Mutex()
     val projectId get() = selected?.optString("id").orEmpty()
@@ -112,10 +114,10 @@ class AppModel(app: Application): AndroidViewModel(app) {
         }
     }
     fun chooseProject(value: JSONObject) {
+        detachChat()
         selected = value
         preferences.edit().putString("project", projectId).apply()
         folder = ""; files = emptyList(); filePath = ""; searchResults = emptyList()
-        agentSocket?.close(1000, "switch")
         agent = null; messages.clear(); permission = null; agentBusy = false
         act { refreshFiles(); refreshSessions() }
     }
@@ -209,6 +211,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         val request = JSONObject().put("projectId", projectId)
         if (resume != null) request.put("resumeId", resume.getString("id"))
         val metadata = api.obj("/v1/agents", "POST", request)
+        detachChat()
         agent = metadata; agentBusy = metadata.optString("state") in listOf("running", "waiting")
         messages.clear(); permission = null; lastSequence = 0
         val history = api.array("/v1/agents/" + metadata.getString("id") + "/history")
@@ -218,29 +221,96 @@ class AppModel(app: Application): AndroidViewModel(app) {
         tab = 1
     }
     fun connectChat() {
-        val id = agent?.optString("id") ?: return
+        reconnectAttempt = 0
+        openChat()
+    }
+    private fun detachChat() {
+        chatGeneration++
         reconnectJob?.cancel()
-        agentSocket?.close(1000, "reconnect")
+        agentSocket?.cancel()
+        agentSocket = null
+        chatConnected = false
+    }
+    fun resumeConnections() {
+        if (agent != null && !chatConnected) connectChat()
+    }
+    private fun chatDisconnected(generation: Long, status: Int? = null) {
+        if (generation != chatGeneration) return
+        chatConnected = false
+        if (status == 409) {
+            agentBusy = false
+            permission = null
+            note = "本地会话已中断，请从历史会话恢复"
+            return
+        }
+        if (status == 401) {
+            connected = false
+            note = "本地连接凭据已失效，请重新连接环境"
+            return
+        }
+        if (reconnectAttempt == 0) note = "对话连接中断，正在重新连接；本地任务可能仍在运行"
+        val delayMillis = minOf(30_000L, 2_000L shl minOf(reconnectAttempt++, 4))
+        reconnectJob?.cancel()
+        reconnectJob = viewModelScope.launch {
+            delay(delayMillis)
+            if (generation == chatGeneration) {
+                reconnectJob = null
+                openChat()
+            }
+        }
+    }
+    private fun openChat() {
+        val id = agent?.optString("id") ?: return
+        detachChat()
+        val generation = chatGeneration
+        try {
         agentSocket = api.socket("/v1/agents/$id/stream?after=$lastSequence", object: WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                viewModelScope.launch { chatConnected = true }
-            }
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                viewModelScope.launch { try { consume(JSONObject(text)) } catch (_: Exception) { } }
-            }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 viewModelScope.launch {
-                    chatConnected = false
-                    note = "对话连接中断，任务可能仍在本地运行；可点击重新连接"
+                    if (generation == chatGeneration) {
+                        chatConnected = true
+                        reconnectAttempt = 0
+                    } else webSocket.cancel()
                 }
             }
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                viewModelScope.launch {
+                    if (generation == chatGeneration) try { consume(JSONObject(text)) } catch (_: Exception) { }
+                }
+            }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                viewModelScope.launch { chatDisconnected(generation, response?.code) }
+            }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(code, reason)
+            }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                viewModelScope.launch { chatDisconnected(generation) }
+            }
         })
+        } catch (error: ApiException) {
+            chatDisconnected(generation, error.status)
+        }
     }
     private fun addAssistant(text: String) {
         if (messages.lastOrNull()?.role == "assistant") {
             val old = messages.removeAt(messages.lastIndex)
             messages.add(old.copy(text = old.text + text))
         } else messages.add(ChatLine("assistant", text))
+    }
+    private fun showToolOutput(update: JSONObject) {
+        if (!update.has("content")) return
+        val id = update.optString("toolCallId")
+        if (id.isBlank()) return
+        val text = update.optJSONArray("content")?.objects()?.mapNotNull {
+            val content = it.optJSONObject("content")
+            if (it.optString("type") == "content" && content?.optString("type") == "text") content.optString("text") else null
+        }?.joinToString("\n").orEmpty()
+        if (text.isBlank()) return
+        val visible = if (text.length > 24_000) text.take(24_000) + "\n…输出较长，完整内容保留在本地会话记录中" else text
+        val index = messages.indexOfFirst { it.toolId == id }
+        val line = ChatLine("tool", visible, id)
+        if (index < 0) messages.add(line) else messages[index] = line
     }
     fun consume(event: JSONObject) {
         val sequence = event.optLong("seq")
@@ -266,7 +336,11 @@ class AppModel(app: Application): AndroidViewModel(app) {
                         val update = parameters.optJSONObject("update") ?: return
                         when (update.optString("sessionUpdate")) {
                             "agent_message_chunk" -> addAssistant(update.optJSONObject("content")?.optString("text").orEmpty())
-                            "tool_call" -> messages.add(ChatLine("status", "工具：" + update.optString("title", "处理本地项目")))
+                            "tool_call" -> {
+                                messages.add(ChatLine("status", "工具：" + update.optString("title", "处理本地项目")))
+                                showToolOutput(update)
+                            }
+                            "tool_call_update" -> showToolOutput(update)
                             "config_option_update" -> agent = agent?.apply { put("configOptions", update.optJSONArray("configOptions")) }
                         }
                     }
@@ -326,7 +400,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         refreshSessions()
     }
     override fun onCleared() {
-        agentSocket?.close(1000, "ui closed")
+        detachChat()
         terminalSocket?.close(1000, "ui closed")
         super.onCleared()
     }
