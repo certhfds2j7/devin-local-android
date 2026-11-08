@@ -14,6 +14,8 @@
 
 详细步骤见 [中文使用说明](docs/使用说明.md)。
 
+安装包见 [GitHub Releases](https://github.com/certhfds2j7/devin-local-android/releases/latest)。这是非官方客户端，下载更新时保持同一签名；不要卸载 Termux 或删除原有项目数据。
+
 1. 从 [Termux 官方发布页](https://github.com/termux/termux-app/releases) 安装 ARM64 版本，打开一次，完成基础初始化。保留现有 Termux 和 Ubuntu 数据，避免丢失项目及官方登录。
 2. 在 Termux 执行下方命令，允许本客户端调用本地环境：
 

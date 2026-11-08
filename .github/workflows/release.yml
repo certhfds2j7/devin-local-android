@@ -5,7 +5,26 @@ on:
 permissions:
   contents: write
 jobs:
+  signing-configuration:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        name: Check optional cloud signing configuration
+        env:
+          SIGNING_READY: ${{ secrets.DEVIN_KEYSTORE_BASE64 != '' && secrets.DEVIN_STORE_PASSWORD != '' && secrets.DEVIN_KEY_PASSWORD != '' }}
+        run: |
+          echo "ready=$SIGNING_READY" >> "$GITHUB_OUTPUT"
+          if [ "$SIGNING_READY" != "true" ]; then
+            echo '### Cloud signing is not configured' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Signed builds are skipped. Locally signed, verified APKs can be published without uploading the private key.' >> "$GITHUB_STEP_SUMMARY"
+          fi
   release:
+    needs: signing-configuration
+    if: needs.signing-configuration.outputs.ready == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
