@@ -26,10 +26,11 @@ jobs:
       - run: python3 tools/bundle-runtime.py
       - run: python3 -m pip install -r tests/requirements.txt
       - run: python3 -m unittest discover -s tests -v
-      - run: |
-          if ! sdkmanager "platforms/android-36" "build-tools/35.0.0"; then
-            sdkmanager "platforms;android-36" "build-tools;35.0.0"
-          fi
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: 'platforms;android-36 build-tools;35.0.0'
+          log-accepted-android-sdk-licenses: false
       - run: bash ./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug --console=plain
       - uses: actions/upload-artifact@v4
         with:
