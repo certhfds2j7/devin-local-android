@@ -4,11 +4,12 @@ import taskLists from 'markdown-it-task-lists';
 import katex from 'katex';
 import hljs from 'highlight.js/lib/common';
 import createDOMPurify from 'dompurify';
+import {copyFormats} from './copy-formats.js';
 
 function mathPlugin(md) {
-  const formula = (source, displayMode) => katex.renderToString(source, {
+  const formula = (source, displayMode) => '<span class="math-source" data-tex="' + md.utils.escapeHtml(source) + '">' + katex.renderToString(source, {
     displayMode, throwOnError: false, trust: false, strict: 'ignore', maxExpand: 500, maxSize: 30
-  });
+  }) + '</span>';
   md.inline.ruler.before('escape', 'local_math', (state, silent) => {
     const start = state.pos;
     const open = state.src.startsWith('\\(', start) ? '\\(' : state.src[start] === '$' && state.src[start + 1] !== '$' ? '$' : null;
@@ -68,10 +69,7 @@ export function createRenderer(window) {
     if (local(href)) return '<img loading="lazy" alt="' + escape(alt) + '" src="https://appassets.androidplatform.net/project-image?path=' + encodeURIComponent(href) + '">';
     return '<a href="#" data-href="' + escape(href) + '">查看图片：' + escape(alt) + '</a>';
   };
-  return {
-    markdown(text) {
-      return purifier.sanitize(md.render(text), {USE_PROFILES: {html: true, mathMl: true, svg: true},
-        FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form'], FORBID_ATTR: ['srcdoc', 'formaction']});
-    }, escape
-  };
+  const markdown = text => purifier.sanitize(md.render(text), {USE_PROFILES: {html: true, mathMl: true, svg: true},
+    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form'], FORBID_ATTR: ['srcdoc', 'formaction']});
+  return {markdown, escape, copyFormats: source => copyFormats(window, md, markdown(source), source)};
 }

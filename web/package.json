@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test renderer.test.mjs"
+    "test": "node --test renderer.test.mjs message-tools.test.mjs"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",

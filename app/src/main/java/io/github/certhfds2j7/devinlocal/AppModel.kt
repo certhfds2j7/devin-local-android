@@ -19,7 +19,8 @@ import java.security.MessageDigest
 
 fun JSONArray.objects(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
 fun encoded(value: String): String = URLEncoder.encode(value, "UTF-8")
-data class ChatLine(val role: String, val text: String, val toolId: String? = null, val files: List<JSONObject> = emptyList())
+data class ChatLine(val role: String, val text: String, val toolId: String? = null, val files: List<JSONObject> = emptyList(),
+                    val messageId: String = java.util.UUID.randomUUID().toString(), val turnId: String? = null)
 data class RenameItem(val kind: String, val id: String, val name: String)
 
 class AppModel(app: Application): AndroidViewModel(app) {
@@ -60,6 +61,8 @@ class AppModel(app: Application): AndroidViewModel(app) {
     var updateMessage by mutableStateOf("")
     var appUpdate by mutableStateOf<JSONObject?>(null)
     private var lastSequence = 0L
+    private var currentTurnId: String? = null
+    private val historyMutex = Mutex()
     private var reconnectJob: Job? = null
     private var chatGeneration = 0L
     private var reconnectAttempt = 0
@@ -123,7 +126,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         selected = value
         preferences.edit().putString("project", projectId).apply()
         folder = ""; files = emptyList(); filePath = ""; searchResults = emptyList()
-        agent = null; messages.clear(); permission = null; agentBusy = false; pendingAttachments.clear()
+        agent = null; messages.clear(); currentTurnId = null; permission = null; agentBusy = false; pendingAttachments.clear()
         act { refreshFiles(); refreshSessions() }
     }
     fun createProject(name: String, kind: String) = act {
@@ -167,7 +170,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         if (projectId == id) {
             detachChat(); terminalSocket?.close(1000, "project deleted"); terminalSocket = null; terminalId = null
             selected = null; preferences.edit().remove("project").apply()
-            agent = null; messages.clear(); permission = null; agentBusy = false; chatInput = ""; conversations = emptyList()
+            agent = null; messages.clear(); currentTurnId = null; permission = null; agentBusy = false; chatInput = ""; conversations = emptyList()
             pendingAttachments.clear(); files = emptyList(); folder = ""; filePath = ""; editorText = ""; originalText = ""
             fileRevision = "missing"; conflict = false; searchResults = emptyList(); gitStatus = ""; gitDiff = ""
             downloadFiles = emptyList(); downloadFolder = ""; tab = 0
@@ -261,7 +264,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         val metadata = api.obj("/v1/agents", "POST", request)
         detachChat()
         agent = metadata; agentBusy = metadata.optString("state") in listOf("running", "waiting")
-        messages.clear(); permission = null; lastSequence = 0
+        messages.clear(); currentTurnId = null; permission = null; lastSequence = 0
         val history = api.array("/v1/agents/" + metadata.getString("id") + "/history")
         history.objects().forEach { consume(it) }
         connectChat()
@@ -323,7 +326,12 @@ class AppModel(app: Application): AndroidViewModel(app) {
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
                 viewModelScope.launch {
-                    if (generation == chatGeneration) try { consume(JSONObject(text)) } catch (_: Exception) { }
+                    if (generation == chatGeneration) try {
+                        val event = JSONObject(text)
+                        if (event.optString("type") == "history_changed" && event.optLong("seq") > lastSequence)
+                            reloadConversation(id)
+                        else consume(event)
+                    } catch (_: Exception) { }
                 }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -340,11 +348,11 @@ class AppModel(app: Application): AndroidViewModel(app) {
             chatDisconnected(generation, error.status)
         }
     }
-    private fun addAssistant(text: String) {
-        if (messages.lastOrNull()?.role == "assistant") {
+    private fun addAssistant(text: String, sequence: Long) {
+        if (messages.lastOrNull()?.role == "assistant" && messages.lastOrNull()?.turnId == currentTurnId) {
             val old = messages.removeAt(messages.lastIndex)
             messages.add(old.copy(text = old.text + text))
-        } else messages.add(ChatLine("assistant", text))
+        } else messages.add(ChatLine("assistant", text, messageId = "assistant-$sequence", turnId = currentTurnId))
     }
     private fun showToolOutput(update: JSONObject) {
         if (!update.has("content")) return
@@ -357,7 +365,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         if (text.isBlank()) return
         val visible = if (text.length > 24_000) text.take(24_000) + "\n…输出较长，完整内容保留在本地会话记录中" else text
         val index = messages.indexOfFirst { it.toolId == id }
-        val line = ChatLine("tool", visible, id)
+        val line = ChatLine("tool", visible, id, messageId = "tool-$id", turnId = currentTurnId)
         if (index < 0) messages.add(line) else messages[index] = line
     }
     fun consume(event: JSONObject) {
@@ -365,7 +373,11 @@ class AppModel(app: Application): AndroidViewModel(app) {
         if (sequence > 0 && sequence <= lastSequence) return
         lastSequence = maxOf(sequence, lastSequence)
         when (event.optString("type")) {
-            "user" -> messages.add(ChatLine("user", event.optString("text"), files = event.optJSONArray("attachments")?.objects().orEmpty()))
+            "user" -> {
+                currentTurnId = event.optString("turnId").ifBlank { "legacy-$sequence" }
+                messages.add(ChatLine("user", event.optString("text"), files = event.optJSONArray("attachments")?.objects().orEmpty(),
+                    messageId = "user-$currentTurnId", turnId = currentTurnId))
+            }
             "error" -> { messages.add(ChatLine("status", event.optString("message"))); agentBusy = false }
             "complete" -> { agentBusy = false; permission = null; messages.add(ChatLine("status", "本轮任务已结束")) }
             "state" -> {
@@ -386,10 +398,10 @@ class AppModel(app: Application): AndroidViewModel(app) {
                             "agent_message_chunk" -> {
                                 val content = update.optJSONObject("content") ?: return
                                 when (content.optString("type")) {
-                                    "text" -> addAssistant(content.optString("text"))
-                                    "resource_link" -> messages.add(ChatLine("assistant", "", files = listOf(content)))
+                                    "text" -> addAssistant(content.optString("text"), sequence)
+                                    "resource_link" -> messages.add(ChatLine("assistant", "", files = listOf(content), messageId = "resource-$sequence", turnId = currentTurnId))
                                     "resource" -> content.optJSONObject("resource")?.let {
-                                        messages.add(ChatLine("assistant", "", files = listOf(it)))
+                                        messages.add(ChatLine("assistant", "", files = listOf(it), messageId = "resource-$sequence", turnId = currentTurnId))
                                     }
                                 }
                             }
@@ -417,6 +429,20 @@ class AppModel(app: Application): AndroidViewModel(app) {
         pendingAttachments.removeAll(attachments.toSet())
         if (chatInput == text) chatInput = ""
         agentBusy = true
+    }
+    private suspend fun reloadConversation(id: String) = historyMutex.withLock {
+        if (agent?.optString("id") != id) return@withLock
+        detachChat()
+        val rows = api.array("/v1/agents/$id/history")
+        if (agent?.optString("id") != id) return@withLock
+        messages.clear(); currentTurnId = null; permission = null; lastSequence = 0
+        rows.objects().forEach { consume(it) }
+        connectChat()
+    }
+    fun deleteTurn(sessionId: String, turnId: String) = act {
+        api.obj("/v1/agents/$sessionId/turns/" + encoded(turnId), "DELETE")
+        reloadConversation(sessionId)
+        note = "已删除本机这一轮问答记录，代理已有上下文未改变"
     }
     fun cancel() = act {
         val id = agent?.getString("id") ?: return@act
@@ -458,7 +484,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         val id = item.getString("id")
         api.obj("/v1/agents/$id", "DELETE")
         if (agent?.optString("id") == id) {
-            detachChat(); agent = null; messages.clear(); permission = null; agentBusy = false; lastSequence = 0
+            detachChat(); agent = null; messages.clear(); currentTurnId = null; permission = null; agentBusy = false; lastSequence = 0
         }
         refreshSessions()
         note = "已删除这条本机对话记录"

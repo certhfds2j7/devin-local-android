@@ -61,19 +61,25 @@ fun currentConfigLabel(meta: JSONObject?, category: String): String {
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun RichChatPanel(model: AppModel, modifier: Modifier, openLink: (String) -> Unit) {
+fun RichChatPanel(model: AppModel, modifier: Modifier, singleMessage: ChatLine? = null,
+    onCopy: (ChatLine, JSONObject) -> Unit = { _, _ -> }, onAction: (String, ChatLine) -> Unit = { _, _ -> },
+    openLink: (String) -> Unit) {
     val dark = isSystemInDarkTheme()
     val callback by rememberUpdatedState(openLink)
+    val copyCallback by rememberUpdatedState(onCopy)
+    val actionCallback by rememberUpdatedState(onAction)
     val pid = model.projectId
     val session = model.agent?.optString("id")
     val main = remember { Handler(Looper.getMainLooper()) }
     var view by remember { mutableStateOf<WebView?>(null) }
     var loaded by remember { mutableStateOf(false) }
-    val rows = JSONArray(model.messages.map { line ->
-        JSONObject().put("role", line.role).put("text", line.text).put("files", JSONArray(line.files))
+    val rows = JSONArray((singleMessage?.let { listOf(it) } ?: model.messages).map { line ->
+        JSONObject().put("id", line.messageId).put("turnId", line.turnId).put("role", line.role)
+            .put("text", line.text).put("files", JSONArray(line.files))
     }).toString()
+    val options = JSONObject().put("busy", model.agentBusy || model.operations > 0).put("fullscreen", singleMessage != null)
     fun render() {
-        if (loaded) view?.evaluateJavascript("window.renderChat($rows,$dark);", null)
+        if (loaded) view?.evaluateJavascript("window.renderChat($rows,$dark,$options);", null)
     }
     AndroidView(modifier = modifier.clipToBounds(), factory = { context ->
         WebView(context).also { web ->
@@ -96,6 +102,27 @@ fun RichChatPanel(model: AppModel, modifier: Modifier, openLink: (String) -> Uni
                 @JavascriptInterface fun ready() { main.post { loaded = true } }
                 @JavascriptInterface fun openLink(value: String) {
                     main.post { if (model.projectId == pid && model.agent?.optString("id") == session) callback(value) }
+                }
+                @JavascriptInterface fun copyRequest(id: String, payload: String) {
+                    if (payload.length > 2_000_000) { main.post { model.note = "回答较大，请选中部分文字复制，或下载为文件" }; return }
+                    main.post {
+                        if (model.projectId != pid || model.agent?.optString("id") != session) return@post
+                        val line = model.messages.firstOrNull { it.messageId == id && it.role == "assistant" } ?: return@post
+                        try {
+                            val data = JSONObject(payload)
+                            if (data.optString("originalText") == line.text) copyCallback(line, data)
+                            else model.note = "回答正在更新，请重新点击复制"
+                        } catch (_: Exception) { model.note = "暂时无法准备复制内容，请重试" }
+                    }
+                }
+                @JavascriptInterface fun messageAction(action: String, id: String) {
+                    main.post {
+                        if (model.projectId != pid || model.agent?.optString("id") != session) return@post
+                        val line = model.messages.firstOrNull { it.messageId == id } ?: return@post
+                        if ((action == "fullscreen" && line.role == "assistant") ||
+                            (action in listOf("delete-turn", "restart-turn") && line.role == "user" && line.turnId != null && !model.agentBusy && model.operations == 0))
+                            actionCallback(action, line)
+                    }
                 }
             }, "Native")
             web.loadUrl("https://appassets.androidplatform.net/assets/web/chat.html")

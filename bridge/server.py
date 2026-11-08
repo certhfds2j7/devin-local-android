@@ -31,7 +31,7 @@ if os.name == "posix":
     import fcntl
 from aiohttp import web
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MAX_ATTACHMENT = 20 * 1024 * 1024
 MAX_DOWNLOAD = 50 * 1024 * 1024
 BRIDGE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -601,6 +601,7 @@ class Agent:
         self.sequence = 0
         self.busy = False
         self.loading_history = False
+        self.active_turn_id = None
         self.sockets = set()
         self.history = deque(maxlen=2000)
         history_file = SESSIONS / (self.id + ".jsonl")
@@ -623,6 +624,8 @@ class Agent:
     async def broadcast(self, message):
         self.event_sequence += 1
         message = {**message, "seq": self.event_sequence}
+        if self.active_turn_id and "turnId" not in message:
+            message["turnId"] = self.active_turn_id
         self.history.append(message)
         # This is private local conversation history, never included in releases.
         with (SESSIONS / (self.id + ".jsonl")).open("a", encoding="utf-8") as log:
@@ -734,6 +737,7 @@ class Agent:
         self.save()
 
     async def prompt(self, text, attachments=None, blocks=None):
+        self.active_turn_id = str(uuid.uuid4())
         self.busy = True
         self.meta["state"] = "running"
         self.save()
@@ -751,6 +755,7 @@ class Agent:
                 self.meta["state"] = "ready" if self.process.returncode is None else "interrupted"
                 self.save()
                 await self.broadcast({"type": "state", "state": self.meta["state"]})
+            self.active_turn_id = None
 
     async def close(self):
         self.meta["state"] = "closed"
@@ -816,6 +821,42 @@ async def agent_rename(request):
         meta["title"] = title
         atomic_json(SESSIONS / (sid + ".json"), meta)
     return web.json_response(meta)
+
+
+def history_turn_id(row):
+    return row.get("turnId") or "legacy-" + str(row.get("seq", 0))
+
+
+async def turn_delete(request):
+    sid, tid = request.match_info["sid"], request.match_info["turnid"]
+    meta = session_meta(sid)
+    agent = AGENTS.get(sid)
+    if agent and agent.busy:
+        error("请先结束或取消当前任务，再删除这一轮记录", 409)
+    path = SESSIONS / (sid + ".jsonl")
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+    start = next((i for i, row in enumerate(rows) if row.get("type") == "user" and history_turn_id(row) == tid), None)
+    if start is None: error("这一轮记录不存在或已经删除", 404)
+    end = next((i for i in range(start + 1, len(rows)) if rows[i].get("type") == "user"), len(rows))
+    retained = rows[:start] + rows[end:]
+    maximum = max((row.get("seq", 0) for row in rows), default=0)
+    if agent: maximum = max(maximum, agent.event_sequence)
+    changed = {"type": "history_changed", "deletedTurnId": tid, "seq": maximum + 1}
+    retained.append(changed)
+    temporary = path.with_suffix(".jsonl.tmp")
+    temporary.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in retained), encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+    if agent:
+        agent.history = deque(retained, maxlen=2000)
+        agent.event_sequence = changed["seq"]
+        for socket in list(agent.sockets):
+            try: await socket.send_json(changed)
+            except (ConnectionError, RuntimeError): agent.sockets.discard(socket)
+    meta["updated"] = time.time()
+    if agent: agent.meta["updated"] = meta["updated"]
+    atomic_json(SESSIONS / (sid + ".json"), agent.meta if agent else meta)
+    return web.json_response({"ok": True, "deletedTurnId": tid, "scope": "client-local-turn-history"})
 
 
 async def agents(request):
@@ -1237,6 +1278,7 @@ def application():
         web.route("*", "/v1/agents", agents),
         web.delete("/v1/agents/{sid}", agent_delete),
         web.patch("/v1/agents/{sid}", agent_rename),
+        web.delete("/v1/agents/{sid}/turns/{turnid}", turn_delete),
         web.get("/v1/agents/{sid}/stream", agent_stream),
         web.route("*", "/v1/agents/{sid}/{action}", agent_action),
         web.post("/v1/terminals", terminal_create),

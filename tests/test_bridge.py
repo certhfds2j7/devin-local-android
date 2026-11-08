@@ -49,6 +49,64 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         bridge.AGENTS.clear()
         self.temp.cleanup()
 
+    async def test_delete_middle_turn_keeps_other_turns_files_and_official_context_untouched(self):
+        meta = await self.make_agent()
+        agent = bridge.AGENTS[meta['id']]
+        prefix = '/v1/agents/' + agent.id
+        for turn in ('first', 'middle', 'last'):
+            agent.active_turn_id = turn
+            await agent.broadcast({'type':'user','text':turn})
+            await agent.broadcast({'type':'acp','message':{'method':'session/update','params':{'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'reply '+turn}}}}})
+            await agent.broadcast({'type':'complete'})
+        agent.active_turn_id = None
+        other = await self.make_agent()
+        (bridge.project(self.project['id']) / 'keep.txt').write_text('keep')
+        with patch.object(agent, 'rpc', new_callable=AsyncMock) as rpc:
+            response = await self.client.delete(prefix+'/turns/middle',headers=self.auth)
+            self.assertEqual(response.status,200)
+            self.assertEqual((await response.json())['scope'],'client-local-turn-history')
+            rpc.assert_not_called()
+        rows = await (await self.client.get(prefix+'/history',headers=self.auth)).json()
+        self.assertEqual([x['text'] for x in rows if x['type']=='user'],['first','last'])
+        self.assertNotIn('reply middle',json.dumps(rows))
+        self.assertEqual([x['seq'] for x in rows], sorted(set(x['seq'] for x in rows)))
+        self.assertEqual(rows,list(agent.history))
+        self.assertEqual((bridge.project(self.project['id'])/'keep.txt').read_text(),'keep')
+        self.assertTrue((bridge.SESSIONS/(other['id']+'.json')).exists())
+        await agent.close()
+        resumed = bridge.Agent(bridge.session_meta(agent.id))
+        await resumed.start()
+        bridge.AGENTS[agent.id] = resumed
+        self.assertNotIn('reply middle',json.dumps(list(resumed.history)))
+
+    async def test_delete_first_last_and_legacy_turn_and_repeated_delete(self):
+        meta = await self.make_agent(); agent = bridge.AGENTS[meta['id']]
+        prefix='/v1/agents/'+agent.id
+        for value in ('first','last'):
+            await agent.broadcast({'type':'user','text':value})
+            await agent.broadcast({'type':'complete'})
+        rows=list(agent.history)
+        legacy='legacy-'+str(next(x['seq'] for x in rows if x['type']=='user'))
+        response=await self.client.delete(prefix+'/turns/'+legacy,headers=self.auth)
+        self.assertEqual(response.status,200)
+        self.assertEqual((await self.client.delete(prefix+'/turns/'+legacy,headers=self.auth)).status,404)
+        last=next(x for x in agent.history if x.get('text')=='last')
+        self.assertEqual((await self.client.delete(prefix+'/turns/legacy-'+str(last['seq']),headers=self.auth)).status,200)
+        self.assertFalse(any(x['type']=='user' for x in agent.history))
+        previous=agent.event_sequence
+        await agent.broadcast({'type':'user','text':'after deletion'})
+        self.assertGreater(agent.history[-1]['seq'],previous)
+
+    async def test_delete_turn_refuses_busy_agent_and_missing_session(self):
+        meta=await self.make_agent();agent=bridge.AGENTS[meta['id']]
+        await agent.broadcast({'type':'user','text':'keep','turnId':'one'})
+        agent.busy=True
+        prefix='/v1/agents/'+agent.id
+        self.assertEqual((await self.client.delete(prefix+'/turns/one',headers=self.auth)).status,409)
+        self.assertTrue(any(x.get('text')=='keep' for x in agent.history))
+        agent.busy=False
+        self.assertEqual((await self.client.delete('/v1/agents/00000000-0000-0000-0000-000000000000/turns/one',headers=self.auth)).status,404)
+
     async def test_token_and_browser_origin_are_required(self):
         response = await self.client.get("/v1/health")
         self.assertEqual(response.status, 401)

@@ -29,6 +29,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
@@ -101,6 +103,20 @@ class MainActivity: ComponentActivity() {
         var deleteDialog by remember { mutableStateOf<JSONObject?>(null) }
         var renameTarget by remember { mutableStateOf<RenameItem?>(null) }
         var deleteProjectTarget by remember { mutableStateOf<JSONObject?>(null) }
+        var copyData by remember { mutableStateOf<JSONObject?>(null) }
+        var fullscreenId by remember { mutableStateOf<String?>(null) }
+        var turnTarget by remember { mutableStateOf<Pair<String, ChatLine>?>(null) }
+        var restartUnavailable by remember { mutableStateOf(false) }
+        val messageAction: (String, ChatLine) -> Unit = { action, line ->
+            when (action) {
+                "fullscreen" -> fullscreenId = if (fullscreenId == line.messageId) null else line.messageId
+                "delete-turn" -> vm.agent?.optString("id")?.let { turnTarget = it to line }
+                "restart-turn" -> restartUnavailable = true
+            }
+        }
+        LaunchedEffect(vm.projectId, vm.agent?.optString("id")) {
+            fullscreenId = null; copyData = null; turnTarget = null; restartUnavailable = false
+        }
         var cachedDownload by rememberSaveable { mutableStateOf("") }
         val saveDownload = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
             val cached = cachedDownload; cachedDownload = ""
@@ -263,7 +279,7 @@ class MainActivity: ComponentActivity() {
                             Text(if (vm.projectId.isEmpty()) "先在“项目”中选择一个项目" else "开始新对话，或恢复历史会话",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         } else key(vm.projectId, vm.agent?.optString("id")) {
-                            RichChatPanel(vm, Modifier.weight(1f).fillMaxWidth()) { link ->
+                            RichChatPanel(vm, Modifier.weight(1f).fillMaxWidth(), onCopy = { _, data -> copyData = data }, onAction = messageAction) { link ->
                                 val scheme = Uri.parse(link).scheme
                                 when (scheme?.lowercase()) {
                                     "http", "https" -> openUrl(link)
@@ -433,7 +449,66 @@ class MainActivity: ComponentActivity() {
             text = { Text("此终端中的进程会停止，已保存的项目文件会保留。") },
             confirmButton = { TextButton(onClick = { vm.closeTerminal(); closeTerminalDialog = false }) { Text("关闭终端") } },
             dismissButton = { TextButton(onClick = { closeTerminalDialog = false }) { Text("继续使用") } })
+        fullscreenId?.let { id -> vm.messages.firstOrNull { it.messageId == id && it.role == "assistant" }?.let { line ->
+            Dialog(onDismissRequest = { fullscreenId = null }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+                Surface(Modifier.fillMaxSize()) {
+                    Column(Modifier.fillMaxSize().systemBarsPadding()) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Devin 的回答", Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+                            TextButton(onClick = { fullscreenId = null }) { Text("返回对话") }
+                        }
+                        key(vm.projectId, vm.agent?.optString("id"), id) {
+                            RichChatPanel(vm, Modifier.weight(1f).fillMaxWidth(), singleMessage = line,
+                                onCopy = { _, data -> copyData = data }, onAction = messageAction) { link ->
+                                when (Uri.parse(link).scheme?.lowercase()) {
+                                    "http", "https" -> openUrl(link)
+                                    null, "file" -> download(link)
+                                    else -> vm.note = "此链接不属于可下载的项目文件"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } }
+        copyData?.let { data -> AlertDialog(onDismissRequest = { copyData = null }, title = { Text("复制文本") }, text = {
+            Column(Modifier.heightIn(max = 430.dp).verticalScroll(rememberScrollState())) {
+                Text("选择复制形式。富文本粘贴效果取决于目标应用。", style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = { copyAnswer(data.optString("plain")); copyData = null }) { Text("纯文本") }
+                TextButton(onClick = { copyAnswer(data.optString("plain"), data.optString("html")); copyData = null }) { Text("富文本（保留格式）") }
+                TextButton(onClick = { copyAnswer(data.optString("markdown")); copyData = null }) { Text("Markdown 原文") }
+                val codes = data.optJSONArray("codes")?.objects().orEmpty()
+                TextButton(onClick = { copyAnswer(codes.joinToString("\n") { it.optString("code") }); copyData = null }, enabled = codes.isNotEmpty()) { Text("仅代码（全部代码块）") }
+                if (codes.size > 1) codes.forEachIndexed { index, code ->
+                    TextButton(onClick = { copyAnswer(code.optString("code")); copyData = null }) {
+                        Text("代码块 ${index + 1}" + code.optString("language").takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty())
+                    }
+                }
+                if (codes.isEmpty()) Text("这段回答没有独立代码块", style = MaterialTheme.typography.bodySmall)
+            }
+        }, confirmButton = { TextButton(onClick = { copyData = null }) { Text("取消") } }) }
+        turnTarget?.let { (sid, line) -> AlertDialog(onDismissRequest = { turnTarget = null }, title = { Text("删除这一轮问答？") },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(line.text.ifBlank { "附件消息" }.take(120), maxLines = 4)
+                Text("将删除本机的这条提问、对应回答和工具记录，无法撤销。其他轮次、会话和项目文件会保留。")
+                Text("代理已接收的上下文仍会保留，删除记录不能让它忘记这轮内容。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } }, confirmButton = { TextButton(onClick = { line.turnId?.let { vm.deleteTurn(sid, it) }; turnTarget = null },
+                enabled = !vm.agentBusy && vm.operations == 0 && vm.agent?.optString("id") == sid,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除这一轮") } },
+            dismissButton = { TextButton(onClick = { turnTarget = null }) { Text("取消") } }) }
+        if (restartUnavailable) AlertDialog(onDismissRequest = { restartUnavailable = false }, title = { Text("当前核心无法按轮次分叉") },
+            text = { Text("手机上的官方接入未提供按指定步骤分叉的接口，暂时不能排除这一轮及之后的上下文。原会话和项目文件保持原样。\n\n如需从空白上下文开始，可使用“新对话”；它不会继承此前聊天，但仍能访问当前项目文件。") },
+            confirmButton = { TextButton(onClick = { restartUnavailable = false }) { Text("知道了") } })
         vm.permission?.let { PermissionDialog(it, vm::replyPermission) }
+    }
+
+    private fun copyAnswer(plain: String, html: String? = null) {
+        try {
+            require(plain.toByteArray().size + (html?.toByteArray()?.size ?: 0) <= 700_000) { "内容较大，请选择单个代码块或下载文件" }
+            val clip = if (html == null) ClipData.newPlainText("Devin 回答", plain) else ClipData.newHtmlText("Devin 回答", plain, html)
+            (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip)
+            model.note = "已复制"
+        } catch (error: Exception) { model.note = error.message?.takeIf { it.contains("内容较大") } ?: "无法复制，请选择更短的内容" }
     }
 
     private fun stateName(value: String) = when(value) {
