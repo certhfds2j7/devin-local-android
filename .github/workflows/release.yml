@@ -41,7 +41,7 @@ jobs:
           DEVIN_STORE_PASSWORD: ${{ secrets.DEVIN_STORE_PASSWORD }}
           DEVIN_KEY_PASSWORD: ${{ secrets.DEVIN_KEY_PASSWORD }}
           DEVIN_KEY_ALIAS: devinlocal
-        run: bash ./gradlew :app:assembleRelease :app:lintRelease --console=plain
+        run: bash ./gradlew :app:testReleaseUnitTest :app:assembleRelease :app:lintRelease --console=plain
       - name: Verify release identity
         run: |
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs app/build/outputs/apk/release/app-release.apk > "$RUNNER_TEMP/apk-cert.txt"

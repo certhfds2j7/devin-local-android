@@ -56,6 +56,7 @@ object LinkState {
     } catch (_: Exception) { null }
     fun expected(c: Context): String? = prefs(c).getString("pending", null)
     fun expect(c: Context, value: String) { prefs(c).edit().putString("pending", value).apply() }
+    fun finishPending(c: Context) { prefs(c).edit().remove("pending").apply() }
     fun clear(c: Context) { prefs(c).edit().remove("pair").apply() }
 }
 
@@ -102,6 +103,7 @@ object TermuxLauncher {
             .putExtra("com.termux.RUN_COMMAND_BACKGROUND", false))
     }
     fun launch(context: Context) {
+        if (LinkState.changes.value.startsWith("正在连接")) return
         if (ContextCompat.checkSelfPermission(context, PERMISSION) != PackageManager.PERMISSION_GRANTED)
             throw IllegalStateException("请先授予连接 Termux 的权限")
         val action = context.packageName + ".PAIR." + UUID.randomUUID()
@@ -117,17 +119,24 @@ object TermuxLauncher {
             .putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
             .putExtra("com.termux.RUN_COMMAND_BACKGROUND_CUSTOM_LOG_LEVEL", 0)
             .putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", callback)
-        val started = ContextCompat.startForegroundService(context, intent)
+        val started = context.startForegroundService(intent)
         if (started == null) throw IllegalStateException("系统没有启动 Termux，请打开 Termux 后再连接")
         LinkState.changes.value = "正在连接本地环境，请稍候……"
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (LinkState.expected(context) == action && LinkState.changes.value.startsWith("正在连接"))
+                LinkState.changes.value = "初始化尚未完成，请打开 Termux 查看状态后重新连接"
+        }, 10 * 60 * 1000L)
     }
 }
 
 class TermuxResultReceiver: BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != LinkState.expected(context)) return
+        LinkState.finishPending(context)
         val result = intent.getBundleExtra("result")
-        if (result == null || result.getInt("exitCode", -1) != 0 || result.getInt("err", 0) != 0) {
+        if (result == null || !TermuxResultPolicy.success(
+                if (result.containsKey("exitCode")) result.getInt("exitCode") else null,
+                if (result.containsKey("err")) result.getInt("err") else null)) {
             LinkState.changes.value = "本地环境未能启动。请确认 Termux 已初始化并允许应用连接。"
             return
         }
@@ -142,6 +151,11 @@ class TermuxResultReceiver: BroadcastReceiver() {
             LinkState.changes.value = "配对未完成，请再次连接本地环境"
         }
     }
+}
+
+object TermuxResultPolicy {
+    // Termux uses Activity.RESULT_OK (-1) for its own err field, separately from shell exitCode.
+    fun success(exitCode: Int?, errorCode: Int?) = exitCode == 0 && errorCode == Activity.RESULT_OK
 }
 
 class ConnectionService: Service() {

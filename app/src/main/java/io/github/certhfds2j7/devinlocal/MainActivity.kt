@@ -39,6 +39,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 
 class MainActivity: ComponentActivity() {
+    private var recoverPairing = true
     private val model: AppModel by viewModels()
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         if (ContextCompat.checkSelfPermission(this, TermuxLauncher.PERMISSION) == PackageManager.PERMISSION_GRANTED)
@@ -51,7 +52,17 @@ class MainActivity: ComponentActivity() {
             if (Build.VERSION.SDK_INT >= 33) requested.add(Manifest.permission.POST_NOTIFICATIONS)
             permissions.launch(requested.toTypedArray())
         } else try { TermuxLauncher.launch(this) }
-        catch (_: Exception) { model.note = "请先安装并初始化 Termux，再开启应用连接" }
+        catch (error: Exception) {
+            model.note = if (error is IllegalStateException) error.message.orEmpty() else "请先安装并初始化 Termux，再开启应用连接"
+        }
+    }
+    override fun onPostResume() {
+        super.onPostResume()
+        if (recoverPairing && LinkState.token(this) == null &&
+            ContextCompat.checkSelfPermission(this, TermuxLauncher.PERMISSION) == PackageManager.PERMISSION_GRANTED) {
+            recoverPairing = false
+            connect()
+        }
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -111,8 +122,8 @@ class MainActivity: ComponentActivity() {
                     Text("非官方客户端 · 手机本地执行", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }, actions = {
-                TextButton(onClick = { if (vm.connected) vm.refresh() else onConnect() }) {
-                    Text(if (vm.connected) "● 已连接" else "连接环境")
+                TextButton(onClick = { if (vm.connected) vm.refresh() else onConnect() }, enabled = !vm.connecting) {
+                    Text(if (vm.connecting) "连接中…" else if (vm.connected) "● 已连接" else "连接环境")
                 }
             }) },
             snackbarHost = { SnackbarHost(snackbar) },
@@ -128,17 +139,21 @@ class MainActivity: ComponentActivity() {
             }
         ) { padding ->
             Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
-                if (vm.operations > 0) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (vm.operations > 0 || vm.connecting) LinearProgressIndicator(Modifier.fillMaxWidth())
                 when (vm.tab) {
                     0 -> Page {
                         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
                             Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text("在手机上编程", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                                 Text("项目、编辑和命令留在手机上，AI 使用你的官方账号联网。", style = MaterialTheme.typography.bodyMedium)
-                                if (!vm.connected) Button(onClick = onConnect) { Text("连接本地环境") }
+                                if (!vm.connected) {
+                                    Text(vm.connectionMessage, fontWeight = FontWeight.SemiBold)
+                                    if (vm.connecting) Text("首次连接需要安装本地组件，可能需要几分钟。请保持网络和 Termux 运行。", fontSize = 12.sp)
+                                    Button(onClick = onConnect, enabled = !vm.connecting) { Text(if (vm.connecting) "正在准备本地环境…" else "连接本地环境") }
+                                }
                             }
                         }
-                        if (!vm.connected) SetupGuide(onConnect)
+                        if (!vm.connected) SetupGuide(onConnect, vm.connecting)
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Text("我的项目", style = MaterialTheme.typography.titleMedium)
                             FilledTonalButton(onClick = { createDialog = true }, enabled = vm.connected) { Text("＋ 新建项目") }
@@ -327,7 +342,7 @@ class MainActivity: ComponentActivity() {
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp), content = content)
     }
-    @Composable private fun SetupGuide(connect: () -> Unit) {
+    @Composable private fun SetupGuide(connect: () -> Unit, connecting: Boolean) {
         OutlinedCard {
             Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("首次连接", fontWeight = FontWeight.SemiBold)
@@ -342,7 +357,7 @@ class MainActivity: ComponentActivity() {
                     TextButton(onClick = { openTermux() }) { Text("打开 Termux") }
                 }
                 Text("已完成本机初始化时，直接点击连接环境。", style = MaterialTheme.typography.bodySmall)
-                Button(onClick = connect) { Text("连接环境") }
+                Button(onClick = connect, enabled = !connecting) { Text(if (connecting) "正在连接…" else "连接环境") }
             }
         }
     }
@@ -386,7 +401,7 @@ class MainActivity: ComponentActivity() {
             Section("本地环境") {
                 Text(vm.connectionMessage)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = connect) { Text("启动 / 重新连接") }
+                    Button(onClick = connect, enabled = !vm.connecting) { Text(if (vm.connecting) "正在连接…" else "启动 / 重新连接") }
                     TextButton(onClick = { openTermux() }) { Text("打开 Termux") }
                 }
                 TextButton(onClick = {

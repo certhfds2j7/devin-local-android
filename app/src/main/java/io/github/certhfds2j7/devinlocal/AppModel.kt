@@ -26,6 +26,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
     private val preferences = app.getSharedPreferences("workspace", 0)
     var tab by mutableIntStateOf(0)
     var connected by mutableStateOf(false)
+    var connecting by mutableStateOf(false)
     var connectionMessage by mutableStateOf("连接手机上的本地环境，开始编程")
     var note by mutableStateOf("")
     var operations by mutableIntStateOf(0)
@@ -66,6 +67,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
             LinkState.changes.collect { value ->
                 if (value.isNotEmpty()) {
                     connectionMessage = value
+                    connecting = value.startsWith("正在连接")
                     if (value == "本地环境已连接") refresh()
                 }
             }
