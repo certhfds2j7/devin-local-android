@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -96,6 +97,47 @@ class MainActivity: ComponentActivity() {
         var configDialog by remember { mutableStateOf(false) }
         var newFileDialog by remember { mutableStateOf(false) }
         var closeTerminalDialog by remember { mutableStateOf(false) }
+        var downloadDialog by remember { mutableStateOf(false) }
+        var deleteDialog by remember { mutableStateOf<JSONObject?>(null) }
+        var cachedDownload by rememberSaveable { mutableStateOf("") }
+        val saveDownload = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+            val cached = cachedDownload; cachedDownload = ""
+            if (cached.isNotBlank()) vm.act {
+                withContext(Dispatchers.IO) {
+                    val file = File(cached)
+                    require(file.canonicalFile.parentFile == cacheDir.canonicalFile && file.name.startsWith("download-"))
+                    try {
+                        if (uri != null) {
+                            val output = contentResolver.openOutputStream(uri) ?: error("无法写入选择的位置")
+                            output.use { target -> file.inputStream().use { it.copyTo(target) } }
+                        }
+                    } finally { file.delete() }
+                }
+                if (uri != null) vm.note = "文件已保存到选择的位置"
+            }
+        }
+        val download: (String) -> Unit = { path ->
+            if (cachedDownload.isBlank() && vm.operations == 0)
+                vm.prepareDownload(path) { file, name -> cachedDownload = file.absolutePath; saveDownload.launch(name) }
+            else vm.note = "请先完成当前传输或保存操作"
+        }
+        val uploadFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            val destinationProject = vm.projectId
+            if (uris.isNotEmpty()) vm.act {
+                if (uris.size + vm.pendingAttachments.size > 8) error("每次最多附加 8 个文件")
+                for (uri in uris) {
+                    val (name, data) = withContext(Dispatchers.IO) {
+                        val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                            if (cursor.moveToFirst()) cursor.getString(0) else null
+                        } ?: uri.lastPathSegment ?: "附件"
+                        name to readLimited(uri, 20 * 1024 * 1024)
+                    }
+                    check(vm.projectId == destinationProject) { "项目已切换，请在目标项目中重新上传" }
+                    vm.uploadAttachment(name, data)
+                }
+                vm.note = "文件已上传到当前项目，可随消息发送"
+            }
+        }
         val snackbar = remember { SnackbarHostState() }
         val importZip = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) vm.act {
@@ -195,39 +237,41 @@ class MainActivity: ComponentActivity() {
                             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             TextButton(onClick = { vm.startChat() }, enabled = vm.connected && vm.projectId.isNotEmpty()) { Text("新对话") }
                             TextButton(onClick = { vm.act { vm.refreshSessions() }; historyDialog = true }, enabled = vm.connected) { Text("历史会话") }
-                            TextButton(onClick = { configDialog = true }, enabled = vm.agent != null && !vm.agentBusy) { Text("模型与模式") }
+                            TextButton(onClick = { configDialog = true }, enabled = vm.agent != null && !vm.agentBusy) { Text("模型与思考") }
+                            TextButton(onClick = { vm.refreshDownloads(); downloadDialog = true }, enabled = vm.selected != null) { Text("下载文件") }
                             if (vm.agent != null && !vm.chatConnected) TextButton(onClick = { vm.connectChat() }) { Text("重新连接") }
                         }
-                        val scroll = rememberLazyListState()
-                        LaunchedEffect(vm.messages.size, vm.messages.lastOrNull()?.text?.length) {
-                            if (vm.messages.isNotEmpty()) scroll.animateScrollToItem(vm.messages.lastIndex)
+                        if (vm.agent != null) Column(Modifier.fillMaxWidth().clickable(enabled = !vm.agentBusy) { configDialog = true }
+                            .padding(horizontal = 16.dp, vertical = 6.dp)) {
+                            Text("模型：" + currentConfigLabel(vm.agent, "model"), fontSize = 12.sp, maxLines = 2)
+                            Text("模式：" + currentConfigLabel(vm.agent, "mode") + " · 思考：" + currentConfigLabel(vm.agent, "thought_level"), fontSize = 12.sp)
                         }
                         if (vm.agent == null) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                             Text(if (vm.projectId.isEmpty()) "先在“项目”中选择一个项目" else "开始新对话，或恢复历史会话",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        } else LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 14.dp), state = scroll,
-                            verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(vertical = 12.dp)) {
-                            items(vm.messages) { line ->
-                                if (line.role == "status") Text(line.text, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                else Card(colors = CardDefaults.cardColors(containerColor =
-                                    if (line.role == "user") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer)) {
-                                    Column(Modifier.fillMaxWidth().padding(14.dp)) {
-                                        Text(when (line.role) { "user" -> "你"; "tool" -> "本地工具输出"; else -> "Devin" }, fontSize = 11.sp, fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.primary)
-                                        Spacer(Modifier.height(6.dp))
-                                        SelectionContainer { Text(line.text, fontSize = 14.sp,
-                                            fontFamily = if (line.role == "tool") FontFamily.Monospace else FontFamily.Default) }
-                                    }
+                        } else key(vm.projectId, vm.agent?.optString("id")) {
+                            RichChatPanel(vm, Modifier.weight(1f).fillMaxWidth()) { link ->
+                                val scheme = Uri.parse(link).scheme
+                                when (scheme?.lowercase()) {
+                                    "http", "https" -> openUrl(link)
+                                    null, "file" -> download(link)
+                                    else -> vm.note = "此链接不属于可下载的项目文件"
                                 }
                             }
                         }
                         if (vm.agentBusy) Text("代理正在处理任务…", Modifier.padding(horizontal = 16.dp), fontSize = 12.sp)
+                        if (vm.pendingAttachments.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+                            vm.pendingAttachments.toList().forEach { item ->
+                                TextButton(onClick = { vm.pendingAttachments.remove(item) }) { Text(item.optString("name") + " ×") }
+                            }
+                        }
                         Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalAlignment = Alignment.Bottom) {
+                            TextButton(onClick = { uploadFiles.launch(arrayOf("*/*")) }, enabled = vm.selected != null && vm.operations == 0) { Text("附件") }
                             OutlinedTextField(value = vm.chatInput, onValueChange = { vm.chatInput = it }, modifier = Modifier.weight(1f),
                                 placeholder = { Text("描述你想完成的任务") }, maxLines = 4)
                             if (vm.agentBusy) OutlinedButton(onClick = { vm.cancel() }) { Text("取消") }
-                            else Button(onClick = { vm.send(vm.chatInput) }, enabled = vm.agent != null && vm.chatInput.isNotBlank()) { Text("发送") }
+                            else Button(onClick = { vm.send(vm.chatInput) }, enabled = vm.agent != null && vm.operations == 0 && (vm.chatInput.isNotBlank() || vm.pendingAttachments.isNotEmpty())) { Text("发送") }
                         }
                     }
                     2 -> {
@@ -319,11 +363,31 @@ class MainActivity: ComponentActivity() {
             text = { Column(Modifier.verticalScroll(rememberScrollState())) {
                 if (vm.conversations.isEmpty()) Text("当前项目还没有历史会话")
                 vm.conversations.forEach { item ->
-                    TextButton(onClick = { historyDialog = false; vm.startChat(item) }) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(modifier = Modifier.weight(1f), onClick = { historyDialog = false; vm.startChat(item) }) {
                         Text(item.optString("title", "对话") + " · " + stateName(item.optString("state")))
+                    }
+                    TextButton(onClick = { deleteDialog = item }, enabled = item.optString("state") !in listOf("running", "waiting")) { Text("删除") }
                     }
                 }
             } }, confirmButton = { TextButton(onClick = { historyDialog = false }) { Text("关闭") } })
+        deleteDialog?.let { item -> AlertDialog(onDismissRequest = { deleteDialog = null }, title = { Text("删除这条对话？") },
+            text = { Text("将删除本客户端保存的“${item.optString("title", "对话") }”记录，无法在本客户端撤销。项目文件会保留。") },
+            confirmButton = { TextButton(onClick = { vm.deleteConversation(item); deleteDialog = null }) { Text("删除记录") } },
+            dismissButton = { TextButton(onClick = { deleteDialog = null }) { Text("取消") } }) }
+        if (downloadDialog) AlertDialog(onDismissRequest = { downloadDialog = false }, title = { Text("下载项目文件") }, text = {
+            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                Text(vm.downloadFolder.ifBlank { "项目根目录" }, fontSize = 12.sp)
+                if (vm.downloadFolder.isNotEmpty()) TextButton(onClick = { vm.refreshDownloads(vm.downloadFolder.substringBeforeLast("/", "")) }) { Text("‹ 上一级") }
+                vm.downloadFiles.forEach { item ->
+                    TextButton(onClick = {
+                        if (item.optBoolean("directory")) vm.refreshDownloads(item.getString("path"))
+                        else { downloadDialog = false; download(item.getString("path")) }
+                    }) { Text((if (item.optBoolean("directory")) "▸ " else "↓ ") + item.optString("name")) }
+                }
+                if (vm.downloadFiles.isEmpty() && vm.operations == 0) Text("此目录暂无文件")
+            }
+        }, confirmButton = { TextButton(onClick = { downloadDialog = false }) { Text("关闭") } })
         if (gitDialog) GitDialog(vm) { gitDialog = false }
         if (configDialog) ConfigDialog(vm) { configDialog = false }
         if (closeTerminalDialog) AlertDialog(onDismissRequest = { closeTerminalDialog = false }, title = { Text("关闭当前终端？") },
@@ -494,34 +558,39 @@ class MainActivity: ComponentActivity() {
     }
     @Composable private fun ConfigDialog(vm: AppModel, close: () -> Unit) {
         val metadata = vm.agent ?: return
-        fun flatten(options: JSONArray?): List<JSONObject> = options?.objects()?.flatMap {
-            if (it.has("options")) it.getJSONArray("options").objects() else listOf(it)
-        }.orEmpty()
-        AlertDialog(onDismissRequest = close, title = { Text("模型与会话模式") }, text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                val configs = metadata.optJSONArray("configOptions")?.objects().orEmpty().filter {
-                    it.optString("category") in listOf("model", "mode") || it.optString("id").contains("model", true)
-                }
-                configs.forEach { config ->
-                    Text(if (config.optString("category") == "model" || config.optString("id").contains("model", true)) "模型" else "模式",
-                        fontWeight = FontWeight.SemiBold)
-                    flatten(config.optJSONArray("options")).filterNot { unsafeMode(it.optString("value")) }.forEach { option ->
-                        TextButton(onClick = {
-                            vm.configure(JSONObject().put("configId", config.getString("id")).put("value", option.get("value"))); close()
-                        }) { Text(option.optString("name", option.optString("value"))) }
+        var category by remember { mutableStateOf("model") }
+        val config = metadata.optJSONArray("configOptions")?.objects()?.firstOrNull { configCategory(it) == category }
+        AlertDialog(onDismissRequest = close, title = { Text("模型、模式与思考强度") }, text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.horizontalScroll(rememberScrollState())) {
+                    listOf("model" to "模型", "mode" to "模式", "thought_level" to "思考强度").forEach { (value, label) ->
+                        TextButton(onClick = { category = value }) { Text((if (category == value) "● " else "") + label) }
                     }
                 }
-                if (configs.isEmpty()) {
-                    metadata.optJSONObject("models")?.optJSONArray("availableModels")?.objects()?.forEach { option ->
-                        TextButton(onClick = { vm.configure(JSONObject().put("modelId", option.getString("modelId"))); close() }) { Text(option.optString("name")) }
-                    }
-                    metadata.optJSONObject("modes")?.optJSONArray("availableModes")?.objects()?.filterNot { unsafeMode(it.optString("id")) }?.forEach { option ->
-                        TextButton(onClick = { vm.configure(JSONObject().put("modeId", option.getString("id"))); close() }) {
-                            Text(when(option.optString("id")) { "code" -> "编写代码"; "ask" -> "只读问答"; "plan" -> "规划任务"; else -> option.optString("name") })
+                Text("当前：" + currentConfigLabel(metadata, category), fontWeight = FontWeight.SemiBold)
+                Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                    if (config != null) {
+                        configValues(config).filterNot { category == "mode" && unsafeMode(it.optString("value")) }.forEach { option ->
+                            val value = option.getString("value")
+                            Row(Modifier.fillMaxWidth().clickable(enabled = !vm.agentBusy && vm.operations == 0) {
+                                vm.configure(JSONObject().put("configId", config.getString("id")).put("value", value))
+                            }, verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = config.optString("currentValue") == value, onClick = null)
+                                Text(optionLabel(category, value, option.optString("name", value)), Modifier.padding(vertical = 10.dp))
+                            }
+                        }
+                    } else if (category == "thought_level") Text("当前模型未提供可调思考强度；可切换模型后再次查看。")
+                    else {
+                        val legacy = metadata.optJSONObject(if (category == "model") "models" else "modes")
+                        legacy?.optJSONArray(if (category == "model") "availableModels" else "availableModes")?.objects()?.forEach { option ->
+                            val value = option.optString(if (category == "model") "modelId" else "id")
+                            if (category != "mode" || !unsafeMode(value)) TextButton(onClick = {
+                                vm.configure(JSONObject().put(if (category == "model") "modelId" else "modeId", value))
+                            }, enabled = vm.operations == 0 && !vm.agentBusy) { Text(optionLabel(category, value, option.optString("name", value))) }
                         }
                     }
-                    Text("可用选项由官方代理和账号权限提供。", fontSize = 12.sp)
                 }
+                Text("选项由官方代理和当前模型提供，切换后立即生效。", fontSize = 12.sp)
             }
         }, confirmButton = { TextButton(onClick = close) { Text("关闭") } })
     }

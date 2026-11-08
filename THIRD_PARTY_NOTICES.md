@@ -5,7 +5,7 @@ APK 内附完整许可：app/src/main/assets/THIRD_PARTY_LICENSES.txt。
 - AndroidX、Jetpack Compose、Android WebKit：Apache-2.0。
 - Kotlin、kotlinx.coroutines：Apache-2.0。
 - OkHttp、Okio：Apache-2.0。
-- 下列离线网页依赖：MIT（完整版权声明随 APK 提供）。
+- 下列离线网页及开发依赖采用 MIT、BSD、Apache、MPL 等许可，完整许可和版权声明随 APK 提供。
 
 - @codemirror/autocomplete 6.20.4
 - @codemirror/commands 6.11.1
@@ -20,6 +20,7 @@ APK 内附完整许可：app/src/main/assets/THIRD_PARTY_LICENSES.txt。
 - @codemirror/streamparser 6.0.0
 - @codemirror/theme-one-dark 6.1.3
 - @codemirror/view 6.43.15
+- @exodus/bytes 1.16.0
 - @lezer/common 1.5.5
 - @lezer/css 1.3.9
 - @lezer/highlight 1.2.5
@@ -28,11 +29,46 @@ APK 内附完整许可：app/src/main/assets/THIRD_PARTY_LICENSES.txt。
 - @lezer/lr 1.4.12
 - @lezer/python 1.1.19
 - @marijn/find-cluster-break 1.0.4
+- @types/trusted-types 2.0.7
 - @xterm/addon-fit 0.11.0
 - @xterm/xterm 6.0.0
+- argparse 3.0.4
+- bcp-47 2.1.2
+- bcp-47-match 2.0.3
 - codemirror 6.0.2
+- commander 15.1.0
 - crelt 1.0.7
+- data-urls 8.0.0
+- dompurify 3.4.17
+- entities 9.0.0
+- highlight.js 11.12.0
+- html-encoding-sniffer 7.0.0
+- is-alphabetical 2.0.1
+- is-alphanumerical 2.0.1
+- is-decimal 2.0.1
+- jsdom 31.0.0
+- katex 0.19.1
+- linkify-it 6.1.0
+- lru-cache 11.5.3
+- markdown-it 15.0.3
+- markdown-it-footnote 4.0.0
+- markdown-it-task-lists 2.1.1
+- mdurl 2.1.0
+- parse5 8.1.0
+- parse5-parser-stream 8.1.0
 - style-mod 4.1.4
+- tldts 7.4.19
+- tldts-core 7.4.20
+- tough-cookie 6.1.0
+- tr46 7.0.0
+- uc.micro 3.0.0
+- undici 8.12.4
 - w3c-keyname 2.2.8
+- w3c-xmlserializer 6.0.0
+- webidl-conversions 8.0.1
+- whatwg-mimetype 5.0.0
+- whatwg-url 17.3.0
+- xml-name-validator 5.0.0
+- xmlchars 2.2.0
 
 Python aiohttp、Ubuntu、Termux、Node.js 和官方 Devin CLI 由用户设备从各自发行渠道安装，未重新打包进 APK。各自许可与服务条款独立适用。

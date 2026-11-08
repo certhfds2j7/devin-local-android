@@ -70,6 +70,108 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 409)
         self.assertEqual(target.read_text(), "agent changed this")
 
+    async def test_binary_attachment_and_download_preserve_bytes_and_unicode_filename(self):
+        data = bytes(range(256)) * 4
+        response = await self.client.post(self.path + "/attachments", params={"name": "中文数据.bin"}, headers=self.auth, data=data)
+        self.assertEqual(response.status, 201)
+        attachment = await response.json()
+        self.assertEqual(attachment["sha256"], hashlib.sha256(data).hexdigest())
+        response = await self.client.get(self.path + "/download", params={"path": attachment["path"]}, headers=self.auth)
+        self.assertEqual(await response.read(), data)
+        self.assertEqual(response.headers["X-Content-SHA256"], attachment["sha256"])
+        self.assertIn("filename*=UTF-8''", response.headers["Content-Disposition"])
+        again = await (await self.client.post(self.path + "/attachments", params={"name": "中文数据.bin"}, headers=self.auth, data=b"new")).json()
+        self.assertNotEqual(attachment["path"], again["path"])
+
+    async def test_upload_limits_and_invalid_names_leave_no_partial_file(self):
+        for name in ("../secret", "..", "a/b.txt", "a\\b.txt", "a\n.txt"):
+            response = await self.client.post(self.path + "/attachments", params={"name": name}, headers=self.auth, data=b"x")
+            self.assertEqual(response.status, 400)
+        with patch.object(bridge, "MAX_ATTACHMENT", 4):
+            response = await self.client.post(self.path + "/attachments", params={"name": "large.bin"}, headers=self.auth, data=b"12345")
+            self.assertEqual(response.status, 413)
+        self.assertEqual(list(bridge.project(self.project["id"]).glob("attachments/*/*")), [])
+
+    async def test_encoded_markdown_download_links_preserve_unicode_spaces_and_path_boundary(self):
+        from urllib.parse import quote
+        uploaded = await (await self.client.post(self.path + "/attachments", params={"name": "中文 文件.bin"}, headers=self.auth, data=b"unicode-file")).json()
+        response = await self.client.get(self.path + "/download", params={"path": quote(uploaded["path"])}, headers=self.auth)
+        self.assertEqual(await response.read(), b"unicode-file")
+        literal = bridge.project(self.project["id"]) / "literal%20name.txt"
+        literal.write_bytes(b"literal-percent")
+        response = await self.client.get(self.path + "/download", params={"path": literal.name}, headers=self.auth)
+        self.assertEqual(await response.read(), b"literal-percent")
+        response = await self.client.get(self.path + "/download", params={"path": "%2e%2e/%2e%2e/secret.txt"}, headers=self.auth)
+        self.assertEqual(response.status, 403)
+
+    async def test_download_cannot_read_outside_project_or_git_internal_data(self):
+        outside = bridge.ROOT / "secret.txt"
+        outside.write_text("private")
+        for path in ("../../secret.txt", outside.as_uri(), ".git/config", "https://example.invalid/file"):
+            response = await self.client.get(self.path + "/download", params={"path": path}, headers=self.auth)
+            self.assertEqual(response.status, 403)
+        response = await self.client.get(self.path + "/download", params={"path": "missing.bin"}, headers=self.auth)
+        self.assertEqual(response.status, 404)
+
+    async def test_attachments_reject_other_projects_and_external_changes(self):
+        uploaded = await (await self.client.post(self.path + "/attachments", params={"name": "input.txt"}, headers=self.auth, data=b"original")).json()
+        agent = await self.make_agent()
+        prefix = "/v1/agents/" + agent["id"]
+        other = await (await self.client.post("/v1/projects", headers=self.auth, json={"name": "other", "kind": "empty"})).json()
+        other_agent = await (await self.client.post("/v1/agents", headers=self.auth, json={"projectId": other["id"]})).json()
+        response = await self.client.post("/v1/agents/" + other_agent["id"] + "/prompt", headers=self.auth, json={"text": "test", "attachments": [uploaded["id"]]})
+        self.assertEqual(response.status, 404)
+        (bridge.project(self.project["id"]) / uploaded["path"]).write_text("changed")
+        response = await self.client.post(prefix + "/prompt", headers=self.auth, json={"text": "test", "attachments": [uploaded["id"]]})
+        self.assertEqual(response.status, 409)
+
+    async def test_prompt_sends_actual_image_and_resource_content_and_persists_attachment_reference(self):
+        image = b"\x89PNG\r\n\x1a\nfixture"
+        uploaded = await (await self.client.post(self.path + "/attachments", params={"name": "image.png"}, headers=self.auth, data=image)).json()
+        agent = await self.make_agent()
+        prefix = "/v1/agents/" + agent["id"]
+        response = await self.client.post(prefix + "/prompt", headers=self.auth, json={"text": "", "attachments": [uploaded["id"]]})
+        self.assertEqual(response.status, 200)
+        await self.wait_permission(agent)
+        prompt = json.loads((bridge.project(self.project["id"]) / "fixture-prompt.json").read_text())
+        self.assertIn("resource_link", [x["type"] for x in prompt])
+        import base64
+        self.assertEqual(base64.b64decode(next(x["data"] for x in prompt if x["type"] == "image")), image)
+        history = await (await self.client.get(prefix + "/history", headers=self.auth)).json()
+        self.assertEqual(history[0]["attachments"][0]["id"], uploaded["id"])
+
+    async def test_thought_level_uses_advertised_values_and_returns_confirmed_state(self):
+        agent = await self.make_agent()
+        prefix = "/v1/agents/" + agent["id"]
+        response = await self.client.post(prefix + "/configure", headers=self.auth, json={"configId": "thought_level", "value": "invented"})
+        self.assertEqual(response.status, 400)
+        response = await self.client.post(prefix + "/configure", headers=self.auth, json={"configId": "thought_level", "value": "low"})
+        self.assertEqual(response.status, 200)
+        meta = await response.json()
+        self.assertEqual(next(x["currentValue"] for x in meta["configOptions"] if x["id"] == "thought_level"), "low")
+
+    async def test_delete_one_history_preserves_other_session_and_project_files(self):
+        first, second = await self.make_agent(), await self.make_agent()
+        for meta in (first, second): await bridge.AGENTS[meta["id"]].broadcast({"type": "user", "text": "fixture history"})
+        target = bridge.project(self.project["id"]) / "keep.txt"
+        target.write_text("keep")
+        response = await self.client.delete("/v1/agents/" + first["id"], headers=self.auth)
+        self.assertEqual(response.status, 200)
+        self.assertFalse((bridge.SESSIONS / (first["id"] + ".jsonl")).exists())
+        self.assertFalse((bridge.SESSIONS / (first["id"] + ".json")).exists())
+        rows = await (await self.client.get("/v1/agents", headers=self.auth)).json()
+        self.assertEqual([x["id"] for x in rows], [second["id"]])
+        self.assertTrue((bridge.SESSIONS / (second["id"] + ".jsonl")).exists())
+        self.assertEqual(target.read_text(), "keep")
+
+    async def test_delete_running_session_is_rejected(self):
+        agent = await self.make_agent()
+        await self.client.post("/v1/agents/" + agent["id"] + "/prompt", headers=self.auth, json={"text": "fixture"})
+        await self.wait_permission(agent)
+        response = await self.client.delete("/v1/agents/" + agent["id"], headers=self.auth)
+        self.assertEqual(response.status, 409)
+        self.assertTrue((bridge.SESSIONS / (agent["id"] + ".json")).exists())
+
     async def test_paths_cannot_escape_workspace(self):
         response = await self.client.put(self.path + "/file?path=../../outside.txt", headers=self.auth,
                                          json={"revision": "missing", "content": "bad"})
@@ -163,6 +265,19 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         loaded = bridge.AGENTS[agent["id"]]
         self.assertTrue(any(x.get("text") == "retained history" for x in loaded.history))
+        self.assertNotIn("Replay must not be duplicated", json.dumps(list(loaded.history)))
+
+    async def test_repeated_session_load_does_not_append_replayed_messages(self):
+        agent = await self.make_agent()
+        await bridge.AGENTS[agent["id"]].broadcast({"type": "user", "text": "preserve original"})
+        for _ in range(2):
+            previous = bridge.AGENTS.pop(agent["id"])
+            await previous.close()
+            response = await self.client.post("/v1/agents", headers=self.auth, json={"projectId": self.project["id"], "resumeId": agent["id"]})
+            self.assertEqual(response.status, 200)
+        rows = [json.loads(line) for line in (bridge.SESSIONS / (agent["id"] + ".jsonl")).read_text().splitlines()]
+        self.assertEqual([x["text"] for x in rows if x.get("type") == "user"], ["preserve original"])
+        self.assertNotIn("Replay must not be duplicated", json.dumps(rows))
 
     async def test_failed_candidate_restores_configuration_without_losing_versions(self):
         home = bridge.ROOT / "home"

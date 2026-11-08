@@ -16,7 +16,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 
 @SuppressLint("SetJavaScriptEnabled")
-private fun offlineWebView(view: WebView, ready: () -> Unit) {
+internal fun offlineWebView(view: WebView, resource: ((WebResourceRequest) -> WebResourceResponse?)? = null, ready: () -> Unit) {
     val loader = WebViewAssetLoader.Builder().addPathHandler("/assets/",
         WebViewAssetLoader.AssetsPathHandler(view.context)).build()
     view.settings.javaScriptEnabled = true
@@ -51,6 +51,7 @@ private fun offlineWebView(view: WebView, ready: () -> Unit) {
         override fun shouldInterceptRequest(v: WebView?, request: WebResourceRequest): WebResourceResponse? {
             if (request.url.host != "appassets.androidplatform.net")
                 return WebResourceResponse("text/plain", "utf-8", 403, "Blocked", emptyMap(), "".byteInputStream())
+            resource?.invoke(request)?.let { return it }
             return loader.shouldInterceptRequest(request.url)
         }
         override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest) = true

@@ -19,7 +19,7 @@ import java.security.MessageDigest
 
 fun JSONArray.objects(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
 fun encoded(value: String): String = URLEncoder.encode(value, "UTF-8")
-data class ChatLine(val role: String, val text: String, val toolId: String? = null)
+data class ChatLine(val role: String, val text: String, val toolId: String? = null, val files: List<JSONObject> = emptyList())
 
 class AppModel(app: Application): AndroidViewModel(app) {
     val api = BridgeClient(app)
@@ -42,6 +42,9 @@ class AppModel(app: Application): AndroidViewModel(app) {
     var permission by mutableStateOf<JSONObject?>(null)
     var chatConnected by mutableStateOf(false)
     var chatInput by mutableStateOf("")
+    val pendingAttachments = mutableStateListOf<JSONObject>()
+    var downloadFolder by mutableStateOf("")
+    var downloadFiles by mutableStateOf<List<JSONObject>>(emptyList())
     var filePath by mutableStateOf("")
     var editorText by mutableStateOf("")
     var originalText by mutableStateOf("")
@@ -118,7 +121,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         selected = value
         preferences.edit().putString("project", projectId).apply()
         folder = ""; files = emptyList(); filePath = ""; searchResults = emptyList()
-        agent = null; messages.clear(); permission = null; agentBusy = false
+        agent = null; messages.clear(); permission = null; agentBusy = false; pendingAttachments.clear()
         act { refreshFiles(); refreshSessions() }
     }
     fun createProject(name: String, kind: String) = act {
@@ -317,7 +320,7 @@ class AppModel(app: Application): AndroidViewModel(app) {
         if (sequence > 0 && sequence <= lastSequence) return
         lastSequence = maxOf(sequence, lastSequence)
         when (event.optString("type")) {
-            "user" -> messages.add(ChatLine("user", event.optString("text")))
+            "user" -> messages.add(ChatLine("user", event.optString("text"), files = event.optJSONArray("attachments")?.objects().orEmpty()))
             "error" -> { messages.add(ChatLine("status", event.optString("message"))); agentBusy = false }
             "complete" -> { agentBusy = false; permission = null; messages.add(ChatLine("status", "本轮任务已结束")) }
             "state" -> {
@@ -335,13 +338,26 @@ class AppModel(app: Application): AndroidViewModel(app) {
                     "session/update" -> {
                         val update = parameters.optJSONObject("update") ?: return
                         when (update.optString("sessionUpdate")) {
-                            "agent_message_chunk" -> addAssistant(update.optJSONObject("content")?.optString("text").orEmpty())
+                            "agent_message_chunk" -> {
+                                val content = update.optJSONObject("content") ?: return
+                                when (content.optString("type")) {
+                                    "text" -> addAssistant(content.optString("text"))
+                                    "resource_link" -> messages.add(ChatLine("assistant", "", files = listOf(content)))
+                                    "resource" -> content.optJSONObject("resource")?.let {
+                                        messages.add(ChatLine("assistant", "", files = listOf(it)))
+                                    }
+                                }
+                            }
                             "tool_call" -> {
                                 messages.add(ChatLine("status", "工具：" + update.optString("title", "处理本地项目")))
                                 showToolOutput(update)
                             }
                             "tool_call_update" -> showToolOutput(update)
-                            "config_option_update" -> agent = agent?.apply { put("configOptions", update.optJSONArray("configOptions")) }
+                            "config_option_update" -> agent = agent?.let { JSONObject(it.toString()).put("configOptions", update.optJSONArray("configOptions")) }
+                            "current_mode_update" -> agent = agent?.let {
+                                val copy = JSONObject(it.toString())
+                                copy.put("modes", (copy.optJSONObject("modes") ?: JSONObject()).put("currentModeId", update.optString("currentModeId")))
+                            }
                         }
                     }
                 }
@@ -350,7 +366,10 @@ class AppModel(app: Application): AndroidViewModel(app) {
     }
     fun send(text: String) = act {
         val id = agent?.getString("id") ?: throw IllegalStateException("请先开始对话")
-        api.obj("/v1/agents/$id/prompt", "POST", JSONObject().put("text", text))
+        val attachments = pendingAttachments.toList()
+        api.obj("/v1/agents/$id/prompt", "POST", JSONObject().put("text", text)
+            .put("attachments", JSONArray(attachments.map { it.getString("id") })))
+        pendingAttachments.removeAll(attachments.toSet())
         if (chatInput == text) chatInput = ""
         agentBusy = true
     }
@@ -370,6 +389,34 @@ class AppModel(app: Application): AndroidViewModel(app) {
     fun configure(data: JSONObject) = act {
         agent = api.obj("/v1/agents/" + agent!!.getString("id") + "/configure", "POST", data)
         note = "会话设置已更新"
+    }
+    suspend fun uploadAttachment(name: String, bytes: ByteArray) {
+        if (projectId.isEmpty()) throw IllegalStateException("请先选择项目")
+        if (pendingAttachments.size >= 8) throw IllegalStateException("每次最多附加 8 个文件")
+        val pid = projectId
+        val result = JSONObject(String(api.bytes("/v1/projects/$pid/attachments?name=" + encoded(name), "POST", bytes, "application/octet-stream")))
+        if (pid == projectId) pendingAttachments.add(result)
+    }
+    fun refreshDownloads(folder: String = "") = act {
+        downloadFiles = api.array("/v1/projects/$projectId/files?path=" + encoded(folder)).objects()
+        downloadFolder = folder
+    }
+    fun prepareDownload(path: String, ready: (File, String) -> Unit) = act {
+        val data = api.bytes("/v1/projects/$projectId/download?path=" + encoded(path), limit = 50 * 1024 * 1024)
+        val uri = android.net.Uri.parse(path)
+        val name = (if (uri.scheme == "file") uri.lastPathSegment else path.substringAfterLast('/'))?.ifBlank { null } ?: "下载文件"
+        val cache = File(getApplication<Application>().cacheDir, "download-" + java.util.UUID.randomUUID())
+        withContext(Dispatchers.IO) { cache.writeBytes(data) }
+        ready(cache, name)
+    }
+    fun deleteConversation(item: JSONObject) = act {
+        val id = item.getString("id")
+        api.obj("/v1/agents/$id", "DELETE")
+        if (agent?.optString("id") == id) {
+            detachChat(); agent = null; messages.clear(); permission = null; agentBusy = false; lastSequence = 0
+        }
+        refreshSessions()
+        note = "已删除这条本机对话记录"
     }
     fun refreshGit() = act {
         val data = api.obj("/v1/projects/$projectId/git")

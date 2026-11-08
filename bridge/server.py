@@ -9,6 +9,7 @@ import difflib
 import hashlib
 import io
 import json
+import mimetypes
 import os
 from pathlib import Path
 import platform
@@ -23,13 +24,16 @@ import time
 import uuid
 import zipfile
 import urllib.request
+from urllib.parse import urlsplit, unquote, quote
 if os.name == "posix":
     import pty
     import termios
     import fcntl
 from aiohttp import web
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+MAX_ATTACHMENT = 20 * 1024 * 1024
+MAX_DOWNLOAD = 50 * 1024 * 1024
 BRIDGE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 ROOT = Path(os.environ.get("DEVIN_ANDROID_DATA", "/mnt/devin-local")).resolve()
 PORT = int(os.environ.get("DEVIN_ANDROID_PORT", "8765"))
@@ -267,6 +271,108 @@ async def file_content(request):
     return web.json_response({"revision": revision(path)})
 
 
+def download_path(root, value):
+    parsed = urlsplit(value)
+    if parsed.scheme and (parsed.scheme != "file" or parsed.netloc not in ("", "localhost")):
+        error("只能下载当前项目中的本地文件", 403)
+    relative = urllib.request.url2pathname(parsed.path) if parsed.scheme else value
+    path = safe_path(root, relative)
+    # Markdown parsers percent-encode Unicode and spaces; file pickers send literal paths.
+    # Prefer an existing literal filename, then resolve an encoded link with the same boundary checks.
+    if not parsed.scheme and not path.exists() and unquote(relative) != relative:
+        path = safe_path(root, unquote(relative))
+    if ".git" in path.relative_to(root.resolve()).parts:
+        error("不能通过对话下载 Git 内部文件", 403)
+    if not path.is_file():
+        error("文件不存在或不是普通文件", 404)
+    return path
+
+
+async def file_download(request):
+    root = project(request.match_info["pid"])
+    path = download_path(root, request.query.get("path", ""))
+    if path.stat().st_size > MAX_DOWNLOAD:
+        error("文件超过 50MB，请通过终端或项目导出处理", 413)
+    content = path.read_bytes()
+    if len(content) > MAX_DOWNLOAD:
+        error("文件超过 50MB", 413)
+    return web.Response(body=content, content_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(path.name),
+                 "X-Content-Type-Options": "nosniff", "X-Content-SHA256": hashlib.sha256(content).hexdigest()})
+
+
+async def attachment_upload(request):
+    pid = request.match_info["pid"]
+    root = project(pid)
+    name = request.query.get("name", "").strip()
+    if not name or len(name) > 180 or name in (".", "..") or any(x in name for x in ("/", "\\")) or any(ord(x) < 32 for x in name):
+        error("附件文件名不正确")
+    if request.content_length and request.content_length > MAX_ATTACHMENT:
+        error("单个附件不能超过 20MB", 413)
+    aid = str(uuid.uuid4())
+    relative = "attachments/" + aid + "/" + name
+    path = safe_path(root, relative)
+    path.parent.mkdir(parents=True, exist_ok=False)
+    size = 0
+    digest = hashlib.sha256()
+    try:
+        with path.open("xb") as output:
+            async for chunk in request.content.iter_chunked(64 * 1024):
+                size += len(chunk)
+                if size > MAX_ATTACHMENT:
+                    error("单个附件不能超过 20MB", 413)
+                digest.update(chunk)
+                output.write(chunk)
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        meta = {"id": aid, "projectId": pid, "name": name, "path": relative,
+                "mimeType": mime, "size": size, "sha256": digest.hexdigest()}
+        store = ROOT / "attachments" / pid
+        store.mkdir(parents=True, exist_ok=True)
+        atomic_json(store / (aid + ".json"), meta)
+        return web.json_response(meta, status=201)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        path.parent.rmdir()
+        raise
+
+
+def prompt_attachments(agent, ids):
+    if not isinstance(ids, list) or len(ids) > 8 or any(not isinstance(x, str) for x in ids) or len(set(ids)) != len(ids):
+        error("每次最多附加 8 个不同文件")
+    root = project(agent.meta["projectId"])
+    attachments, blocks = [], []
+    capabilities = agent.initialized.get("agentCapabilities", {}).get("promptCapabilities", {})
+    model_images = True
+    for option in agent.meta.get("configOptions", []):
+        if option.get("category") == "model":
+            values = [child for item in option.get("options", []) for child in item.get("options", [item])]
+            current = next((x for x in values if x.get("value") == option.get("currentValue")), {})
+            model_images = current.get("_meta", {}).get("cognition.ai/supportsImages", True)
+    for aid in ids:
+        try:
+            if str(uuid.UUID(aid)) != aid: raise ValueError()
+            meta = json.loads((ROOT / "attachments" / agent.meta["projectId"] / (aid + ".json")).read_text())
+        except (ValueError, FileNotFoundError):
+            error("附件不存在或不属于当前项目", 404)
+        path = safe_path(root, meta["path"], True)
+        if not path.is_file() or path.stat().st_size > MAX_ATTACHMENT or revision(path) != meta["sha256"]:
+            error("附件已被修改，请重新上传后发送", 409)
+        attachments.append(meta)
+        link = {"type": "resource_link", "uri": path.as_uri(), "name": meta["name"],
+                "mimeType": meta["mimeType"], "size": meta["size"]}
+        blocks.append(link)
+        if capabilities.get("image") and model_images and meta["mimeType"] in ("image/png", "image/jpeg", "image/webp", "image/gif") and meta["size"] <= 8 * 1024 * 1024:
+            blocks.append({"type": "image", "mimeType": meta["mimeType"], "data": base64.b64encode(path.read_bytes()).decode()})
+        elif capabilities.get("embeddedContext") and meta["size"] <= 200 * 1024:
+            try:
+                text = path.read_text(encoding="utf-8")
+                if "\0" not in text:
+                    blocks.append({"type": "resource", "resource": {"uri": path.as_uri(), "mimeType": meta["mimeType"], "text": text}})
+            except UnicodeError:
+                pass
+    return attachments, blocks
+
+
 async def search(request):
     root = project(request.match_info["pid"])
     query = request.query.get("q", "").strip()
@@ -418,6 +524,7 @@ class Agent:
         self.pending = {}
         self.sequence = 0
         self.busy = False
+        self.loading_history = False
         self.sockets = set()
         self.history = deque(maxlen=2000)
         history_file = SESSIONS / (self.id + ".jsonl")
@@ -490,6 +597,12 @@ class Agent:
                         if update.get("sessionUpdate") == "config_option_update":
                             self.meta["configOptions"] = update.get("configOptions", [])
                             self.save()
+                        elif update.get("sessionUpdate") == "current_mode_update":
+                            self.meta.setdefault("modes", {})["currentModeId"] = update.get("currentModeId")
+                            self.save()
+                        if self.loading_history:
+                            # session/load replays old updates; our durable history already has them.
+                            continue
                     await self.broadcast({"type": "acp", "message": message})
                 else:
                     future = self.pending.get(message.get("id"))
@@ -531,22 +644,27 @@ class Agent:
                 raise RuntimeError("当前代理不支持恢复；历史记录仍保留，请新建对话")
             method = "session/load"
             params["sessionId"] = self.meta["sessionId"]
-        result = await self.rpc(method, params)
+        self.loading_history = method == "session/load"
+        try:
+            result = await self.rpc(method, params)
+        finally:
+            self.loading_history = False
         self.meta["sessionId"] = result.get("sessionId", self.meta.get("sessionId"))
-        self.meta["configOptions"] = result.get("configOptions", [])
-        self.meta["modes"] = result.get("modes", {})
-        self.meta["models"] = result.get("models", {})
+        self.meta["configOptions"] = result.get("configOptions", self.meta.get("configOptions", []))
+        self.meta["modes"] = result.get("modes", self.meta.get("modes", {}))
+        self.meta["models"] = result.get("models", self.meta.get("models", {}))
+        self.meta["promptCapabilities"] = self.initialized.get("agentCapabilities", {}).get("promptCapabilities", {})
         self.meta["state"] = "ready"
         self.save()
 
-    async def prompt(self, text):
+    async def prompt(self, text, attachments=None, blocks=None):
         self.busy = True
         self.meta["state"] = "running"
         self.save()
-        await self.broadcast({"type": "user", "text": text})
+        await self.broadcast({"type": "user", "text": text, "attachments": attachments or []})
         try:
             result = await self.rpc("session/prompt", {"sessionId": self.meta["sessionId"],
-                "prompt": [{"type": "text", "text": text}]}, timeout=None)
+                "prompt": [{"type": "text", "text": text}] + (blocks or [])}, timeout=None)
             await self.broadcast({"type": "complete", "stopReason": result.get("stopReason")})
         except Exception:
             if self.meta["state"] != "closed":
@@ -589,7 +707,23 @@ class Agent:
 def session_meta(sid):
     if str(uuid.UUID(sid)) != sid:
         error("会话编号不正确")
-    return json.loads((SESSIONS / (sid + ".json")).read_text(encoding="utf-8"))
+    path = SESSIONS / (sid + ".json")
+    if not path.exists(): error("对话记录不存在", 404)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+async def agent_delete(request):
+    sid = request.match_info["sid"]
+    session_meta(sid)
+    agent = AGENTS.get(sid)
+    if agent:
+        if agent.busy: error("请先结束或取消此对话中的任务，再删除记录", 409)
+        await agent.close()
+        for socket in list(agent.sockets): await socket.close()
+        AGENTS.pop(sid, None)
+    for suffix in (".json", ".jsonl"):
+        (SESSIONS / (sid + suffix)).unlink(missing_ok=True)
+    return web.json_response({"ok": True, "scope": "client-local-history"})
 
 
 async def agents(request):
@@ -635,12 +769,14 @@ async def agent_action(request):
         if agent.busy or UPDATE["state"] == "running":
             error("请等待当前任务结束，或先取消任务", 409)
         text = str(data.get("text", "")).strip()
+        attachments, blocks = prompt_attachments(agent, data.get("attachments", []))
+        if not text and attachments: text = "请查看附加的文件。"
         if not text:
             error("请输入任务内容")
         if text.split()[0].lower() in ("/cloud", "/handoff", "/ssh", "/forward"):
             error("当前客户端使用手机本地代理模式")
         agent.busy = True
-        agent.prompt_task = asyncio.create_task(agent.prompt(text))
+        agent.prompt_task = asyncio.create_task(agent.prompt(text, attachments, blocks))
         return web.json_response({"ok": True})
     if action == "cancel":
         for original in list(agent.permission_ids.values()):
@@ -671,13 +807,18 @@ async def agent_action(request):
         if agent.busy:
             error("请等待当前任务结束再修改模型或模式", 409)
         if "configId" in data:
+            option = next((x for x in agent.meta.get("configOptions", []) if x.get("id") == data["configId"]), None)
+            values = [child.get("value") for item in (option or {}).get("options", []) for child in item.get("options", [item])]
+            if not option or data.get("value") not in values: error("代理没有提供此配置选项")
             result = await agent.rpc("session/set_config_option", {"sessionId": agent.meta["sessionId"],
                                      "configId": data["configId"], "value": data["value"]})
             agent.meta["configOptions"] = result.get("configOptions", agent.meta.get("configOptions", []))
         elif "modeId" in data:
             await agent.rpc("session/set_mode", {"sessionId": agent.meta["sessionId"], "modeId": data["modeId"]})
+            agent.meta.setdefault("modes", {})["currentModeId"] = data["modeId"]
         elif "modelId" in data and agent.meta.get("models"):
             await agent.rpc("session/set_model", {"sessionId": agent.meta["sessionId"], "modelId": data["modelId"]})
+            agent.meta["models"]["currentModelId"] = data["modelId"]
         else:
             error("代理没有提供此配置选项")
         agent.save()
@@ -981,11 +1122,14 @@ def application():
         web.get("/v1/health", health), web.get("/v1/events", events),
         web.route("*", "/v1/projects", projects),
         web.get("/v1/projects/{pid}/files", file_list),
+        web.get("/v1/projects/{pid}/download", file_download),
+        web.post("/v1/projects/{pid}/attachments", attachment_upload),
         web.route("*", "/v1/projects/{pid}/file", file_content),
         web.get("/v1/projects/{pid}/search", search),
         web.route("*", "/v1/projects/{pid}/git", git),
         web.route("*", "/v1/projects/{pid}/archive", archive),
         web.route("*", "/v1/agents", agents),
+        web.delete("/v1/agents/{sid}", agent_delete),
         web.get("/v1/agents/{sid}/stream", agent_stream),
         web.route("*", "/v1/agents/{sid}/{action}", agent_action),
         web.post("/v1/terminals", terminal_create),

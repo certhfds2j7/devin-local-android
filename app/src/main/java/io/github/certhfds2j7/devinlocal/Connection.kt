@@ -70,13 +70,25 @@ class BridgeClient(private val context: Context) {
         private val streams = http.newBuilder().readTimeout(0, TimeUnit.SECONDS)
             .pingInterval(20, TimeUnit.SECONDS).build()
     }
-    suspend fun bytes(path: String, method: String = "GET", body: ByteArray? = null, type: String = "application/json"): ByteArray =
+    suspend fun bytes(path: String, method: String = "GET", body: ByteArray? = null, type: String = "application/json", limit: Int = 100 * 1024 * 1024): ByteArray =
         withContext(Dispatchers.IO) {
             val token = LinkState.token(context) ?: throw ApiException(401, "请先连接手机本地环境")
             val request = Request.Builder().url(BASE + path).header("Authorization", "Bearer $token")
                 .method(method, if (method == "GET") null else (body ?: ByteArray(0)).toRequestBody(type.toMediaType())).build()
             http.newCall(request).execute().use { response ->
-                val data = response.body?.bytes() ?: ByteArray(0)
+                val responseBody = response.body
+                if ((responseBody?.contentLength() ?: 0) > limit) throw ApiException(413, "文件超过本次传输大小限制")
+                val data = responseBody?.byteStream()?.use { source ->
+                    val output = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val count = source.read(buffer)
+                        if (count < 0) break
+                        if (output.size() + count > limit) throw ApiException(413, "文件超过本次传输大小限制")
+                        output.write(buffer, 0, count)
+                    }
+                    output.toByteArray()
+                } ?: ByteArray(0)
                 if (!response.isSuccessful) {
                     val message = try { JSONObject(String(data)).optString("error", "本地操作未完成") }
                                   catch (_: Exception) { "本地操作未完成（${response.code}）" }
