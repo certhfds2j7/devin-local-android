@@ -96,7 +96,7 @@ object TermuxLauncher {
     const val PERMISSION = "com.termux.permission.RUN_COMMAND"
     fun login(context: Context) {
         val command = "proot-distro login devin-android-gate -- /bin/bash -lc 'export PATH=\"\$HOME/.local/bin:\$PATH\"; exec devin auth login --force-manual-token-flow'"
-        context.startService(Intent("com.termux.RUN_COMMAND").setClassName("com.termux", "com.termux.app.RunCommandService")
+        ContextCompat.startForegroundService(context, Intent("com.termux.RUN_COMMAND").setClassName("com.termux", "com.termux.app.RunCommandService")
             .putExtra("com.termux.RUN_COMMAND_PATH", "\$PREFIX/bin/bash")
             .putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", command))
             .putExtra("com.termux.RUN_COMMAND_BACKGROUND", false))
@@ -117,7 +117,8 @@ object TermuxLauncher {
             .putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
             .putExtra("com.termux.RUN_COMMAND_BACKGROUND_CUSTOM_LOG_LEVEL", 0)
             .putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", callback)
-        context.startService(intent)
+        val started = ContextCompat.startForegroundService(context, intent)
+        if (started == null) throw IllegalStateException("系统没有启动 Termux，请打开 Termux 后再连接")
         LinkState.changes.value = "正在连接本地环境，请稍候……"
     }
 }

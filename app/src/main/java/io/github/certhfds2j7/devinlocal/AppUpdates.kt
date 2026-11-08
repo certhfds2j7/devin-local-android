@@ -43,12 +43,13 @@ object AppUpdates {
             }
         }
     }
-    fun schedule(context: Context) {
+    fun schedule(context: Context): Boolean = try {
         val job = android.app.job.JobInfo.Builder(2701, ComponentName(context, UpdateCheckService::class.java))
             .setRequiredNetworkType(android.app.job.JobInfo.NETWORK_TYPE_ANY)
             .setPeriodic(TimeUnit.DAYS.toMillis(1)).setPersisted(true).build()
-        context.getSystemService(android.app.job.JobScheduler::class.java).schedule(job)
-    }
+        context.getSystemService(android.app.job.JobScheduler::class.java).schedule(job) ==
+            android.app.job.JobScheduler.RESULT_SUCCESS
+    } catch (_: RuntimeException) { false }
     suspend fun download(context: Context, manifest: JSONObject, progress: (Int) -> Unit): File = withContext(Dispatchers.IO) {
         val directory = File(context.cacheDir, "updates").apply { mkdirs() }
         val temporary = File(directory, "update.part")

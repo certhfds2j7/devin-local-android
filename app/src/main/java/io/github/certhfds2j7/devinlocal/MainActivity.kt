@@ -56,7 +56,7 @@ class MainActivity: ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        AppUpdates.schedule(this)
+        if (!AppUpdates.schedule(this)) model.note = "系统暂时无法安排自动更新，请在设置中手动检查"
         val preferences = getSharedPreferences("updates", 0)
         if (System.currentTimeMillis() - preferences.getLong("checked", 0) > 24 * 60 * 60 * 1000L) {
             lifecycleScope.launch {
